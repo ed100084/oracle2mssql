@@ -1,0 +1,28 @@
+oracle:
+  host: "10.6.5.210"
+  port: 1521
+  sid: "MIS"
+  user: "SYS"
+  password: "YOUR_PASSWORD_HERE"
+  mode: "SYSDBA"
+
+mssql:
+  host: "10.7.2.65"
+  port: 1433
+  database: "MIS1"
+  user: "slash"
+  password: "YOUR_PASSWORD_HERE"
+  driver: "ODBC Driver 17 for SQL Server"
+
+conversion:
+  source_schemas:
+    - "HRP"
+  schema_mapping: {}
+  skip_objects: []
+  include_objects:
+    - "EHRPHRA3_PKG"
+  output_dir: "output"
+
+testing:
+  mode: "syntax"
+  max_compare_rows: 1000

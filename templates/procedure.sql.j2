@@ -1,0 +1,24 @@
+{# Template for converted stored procedure #}
+-- ============================================================
+-- Converted from: {{ source_owner }}.{{ source_name }}
+-- Source type: {{ source_type }}
+-- Target: [{{ target_schema }}].[{{ target_name }}]
+-- Converted at: {{ timestamp }}
+-- ============================================================
+
+{% if warnings %}
+-- Warnings:
+{% for w in warnings %}
+-- WARNING: {{ w }}
+{% endfor %}
+{% endif %}
+
+{% if manual_review %}
+-- *** MANUAL REVIEW REQUIRED ***
+{% for r in manual_review %}
+-- REVIEW: {{ r }}
+{% endfor %}
+{% endif %}
+
+{{ tsql_body }}
+GO
