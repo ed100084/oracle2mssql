@@ -105,6 +105,9 @@ class DataTypeRule(ConversionRule):
         # Handle %ROWTYPE references
         result = self._handle_rowtype(result, ctx)
 
+        # COUNT(ROWID) -> COUNT(*) (do this before ROWID is replaced by VARCHAR(18))
+        result = re.sub(r'\bCOUNT\s*\(\s*ROWID\s*\)', 'COUNT(*)', result, flags=re.IGNORECASE)
+
         # Simple type replacements (bare keywords)
         for ora_type, mssql_type in TYPE_MAP.items():
             if ora_type in ("NUMBER", "VARCHAR2", "NVARCHAR2", "CHAR", "RAW", "TIMESTAMP"):

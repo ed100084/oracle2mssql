@@ -76,12 +76,12 @@ class PackageRule(ConversionRule):
                 body = re.sub(
                     r'(?<!\[)\b' + re.escape(sub_name) + r'\s*\(',
                     f'[{schema}].[{sub_name}](',
-                    body
+                    body, flags=re.IGNORECASE
                 )
                 params = re.sub(
                     r'(?<!\[)\b' + re.escape(sub_name) + r'\s*\(',
                     f'[{schema}].[{sub_name}](',
-                    params
+                    params, flags=re.IGNORECASE
                 )
 
             # Schema-qualify cross-package function calls (functions NOT in this package)

@@ -161,7 +161,7 @@ class SyntaxRule(ConversionRule):
         # T-SQL does not allow empty BEGIN ... END blocks. Inject a dummy statement.
         result = re.sub(
             r'\bBEGIN\s*/\*\s*\[ORA2MSSQL:MANUAL_REVIEW\] Function cannot contain GOTO.*?\*/\s*END\b;(?:$|\s)',
-            r'BEGIN\n      /* ORA2MSSQL: GOTO removed */\n      DECLARE @__dummy INT;\n    END;\n',
+            r'BEGIN\n      /* ORA2MSSQL: GOTO removed */\n      PRINT \'GOTO removed\';\n    END;\n',
             result, flags=re.IGNORECASE
         )
 
@@ -904,9 +904,9 @@ class SyntaxRule(ConversionRule):
             # Check if this statement is a CURSOR declaration
             is_cursor = bool(re.search(r'\bCURSOR\b.+?\bIS\b', part, re.IGNORECASE | re.DOTALL))
 
-            # Match SELECT...INTO @var...FROM within this statement fragment
+            # Match SELECT...INTO ...FROM within this statement fragment
             pattern = re.compile(
-                r'\bSELECT\b(.*?)\bINTO\s+(@\w+(?:\s*,\s*@\w+)*)\s+FROM\b',
+                r'\bSELECT\b(.*?)\bINTO\s+([\s\S]*?)\bFROM\b',
                 re.IGNORECASE | re.DOTALL
             )
 
@@ -954,6 +954,7 @@ class SyntaxRule(ConversionRule):
                 if is_cursor:
                     # If this is inside a CURSOR declaration, INTO is invalid syntax
                     # Just strip the INTO vars entirely
+                    # But retain any comments within the SELECT clause if possible, or just the string
                     return f"SELECT {columns_str}\nFROM"
 
                 vars_str = m.group(2).strip()
@@ -961,15 +962,24 @@ class SyntaxRule(ConversionRule):
                 # Strip line comments before splitting to avoid commented-out columns
                 # being treated as extra comma-separated items
                 columns_no_comments = re.sub(r'--.*$', '', columns_str, flags=re.MULTILINE)
+                vars_no_comments = re.sub(r'--.*$', '', vars_str, flags=re.MULTILINE).strip()
+                
+                # Check if it's actually a valid variables list (all starting with @)
+                if not re.match(r'^@\w+(?:\s*,\s*@\w+)*$', vars_no_comments):
+                    return m.group(0)
+
                 # Use paren-aware split so CASE/function commas don't cause mis-splits
                 columns = [c.strip() for c in _split_top_level_commas(columns_no_comments) if c.strip()]
-                variables = [v.strip() for v in vars_str.split(',')]
+                variables = [v.strip() for v in vars_no_comments.split(',')]
 
                 if len(columns) != len(variables):
                     return m.group(0)
 
                 pairs = [f"{var} = {_strip_col_alias(col)}"
                          for var, col in zip(variables, columns)]
+                
+                # We output on a single line to avoid _add_set_keyword incorrectly prepending SET
+                # to lines that start with @var = in a multiline SELECT statement.
                 return "SELECT " + ", ".join(pairs) + " FROM"
 
             result_parts.append(pattern.sub(replace_select_into, part))
