@@ -186,6 +186,12 @@ class FunctionRule(ConversionRule):
                     result, count=1, flags=re.IGNORECASE
                 )
 
+        # = NULL / != NULL / <> NULL comparisons → IS NULL / IS NOT NULL
+        # Oracle allows = NULL but T-SQL requires IS NULL.
+        # Use lookbehind to avoid matching 'IS NULL', 'NOT NULL', and strings.
+        result = re.sub(r'(?<![!<>:])\s*=\s*NULL\b', ' IS NULL', result, flags=re.IGNORECASE)
+        result = re.sub(r'(?:!=|<>)\s*NULL\b', 'IS NOT NULL', result, flags=re.IGNORECASE)
+
         return result
 
     def _replace_func(self, source: str, func_name: str, converter, ctx=None):

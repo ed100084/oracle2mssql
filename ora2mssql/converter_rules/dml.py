@@ -75,6 +75,14 @@ class DmlRule(ConversionRule):
             result, flags=re.IGNORECASE
         )
 
+        # Oracle outer-join syntax: table.col (+) → remove (+), flag for manual review.
+        # Cannot auto-convert to LEFT JOIN without full SQL parse; mark for manual fix.
+        result = re.sub(
+            r'\(\s*\+\s*\)',
+            f'/* {MANUAL_REVIEW_TAG} (+) outer join — convert to LEFT JOIN manually */',
+            result, flags=re.IGNORECASE
+        )
+
         return result
 
     def _convert_currval(self, source: str, ctx: ConversionContext) -> str:

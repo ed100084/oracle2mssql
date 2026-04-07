@@ -145,6 +145,11 @@ class DataTypeRule(ConversionRule):
         # CHR(n) → CHAR(n) (Oracle CHR function → T-SQL CHAR function)
         result = re.sub(r'\bCHR\s*\(', 'CHAR(', result, flags=re.IGNORECASE)
 
+        # Oracle BOOLEAN literals → T-SQL BIT values (1/0)
+        # Must be careful not to replace within identifiers or strings.
+        result = re.sub(r'\bTRUE\b', '1', result, flags=re.IGNORECASE)
+        result = re.sub(r'\bFALSE\b', '0', result, flags=re.IGNORECASE)
+
         return result
 
     def _number_to_int(self, precision: int) -> str:

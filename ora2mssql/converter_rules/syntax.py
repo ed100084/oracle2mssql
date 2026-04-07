@@ -129,6 +129,55 @@ class SyntaxRule(ConversionRule):
         result = re.sub(r'AND\s+ORG_BY\s*=\s*@sOrganType\s*\)\s*;', r'AND ORG_BY = @sOrganType ) AS __derived ;', result, flags=re.IGNORECASE)
         result = re.sub(r'OR\s+chkout3\s*=\s*\'1\'\s*\)\s*\)\s*;', r"OR chkout3 = '1') ) AS __derived ;", result, flags=re.IGNORECASE)
 
+        # Bug 8: offrec_ovrtrans — CURSOR subquery missing alias before ORDER BY
+        # Pattern: )\n  order by signman; inside a DECLARE CURSOR FOR clause
+        result = re.sub(
+            r'\)\s*\n(\s*order\s+by\s+signman\s*;)',
+            r') AS __derived\n\1',
+            result, flags=re.IGNORECASE
+        )
+        # Bug 8: rownum in RANK() OVER ORDER BY → remove rownum (not valid in T-SQL)
+        result = re.sub(
+            r'(order\s+by\s+\w+(?:\s+(?:asc|desc))?)\s*,\s*rownum\b',
+            r'\1',
+            result, flags=re.IGNORECASE
+        )
+
+        # offrec_ovrtrans cursor3 CTE: nested derived tables missing aliases
+        # Fix 1: ) immediately before GROUP BY (innermost derived table)
+        result = re.sub(
+            r'\)\s*\n(\s*)(group\s+by\b)',
+            r') AS __grp_d\n\1\2',
+            result, flags=re.IGNORECASE
+        )
+        # Fix 2: ) where rnk = 1 → ) AS __outer_d where rnk = 1 (outer derived table)
+        result = re.sub(
+            r'\)\s*(where\s+rnk\s*=\s*1)',
+            r') AS __outer_d \1',
+            result, flags=re.IGNORECASE
+        )
+        # Fix 3: ) before ) where (middle derived table, applied after fix 2)
+        result = re.sub(
+            r'\)\s*\n(\s*\)\s+AS\s+__outer_d\b)',
+            r') AS __mid_d\n\1',
+            result, flags=re.IGNORECASE
+        )
+
+        # Fix: UPDATE SET col IS NULL → UPDATE SET col = NULL
+        # (= NULL → IS NULL conversion incorrectly applied to SET assignments)
+        result = re.sub(
+            r'\bSET\s+(\w+)\s+IS\s+NULL\b',
+            r'SET \1 = NULL',
+            result, flags=re.IGNORECASE
+        )
+
+        # Fix: hrpuser.MAILQUEUE.insertMailQueue(args) standalone call → EXEC
+        result = re.sub(
+            r'^(\s*)hrpuser\.MAILQUEUE\.insertMailQueue\s*\(([^;]*)\)\s*;',
+            lambda m: f"{m.group(1)}EXEC [hrpuser].[insertMailQueue] {m.group(2).strip()};",
+            result, flags=re.IGNORECASE | re.MULTILINE
+        )
+
         # Fix Oracle source typo IN '1' in f_hra4010_C_MIN
         result = result.replace("chkout2 IN '1'", "chkout2 = '1'")
 
@@ -159,14 +208,32 @@ class SyntaxRule(ConversionRule):
         # ---------------------------------------------------------
 
         # T-SQL does not allow empty BEGIN ... END blocks. Inject a dummy statement.
+        # Use a counter for unique DECLARE names to avoid redeclaration errors in
+        # functions where multiple GOTO-removed blocks may appear.
+        _goto_noop_counter = [0]
+        def _make_goto_noop(m):
+            _goto_noop_counter[0] += 1
+            return (
+                f'BEGIN\n      /* ORA2MSSQL: GOTO removed */\n'
+                f'      DECLARE @__goto{_goto_noop_counter[0]} INT = 0;  -- no-op\n'
+                f'    END;\n'
+            )
         result = re.sub(
-            r'\bBEGIN\s*/\*\s*\[ORA2MSSQL:MANUAL_REVIEW\] Function cannot contain GOTO.*?\*/\s*END\b;(?:$|\s)',
-            r'BEGIN\n      /* ORA2MSSQL: GOTO removed */\n      PRINT \'GOTO removed\';\n    END;\n',
+            r'\bBEGIN\s*/\*\s*\[ORA2MSSQL:MANUAL_REVIEW\] Function cannot contain GOTO.*?\*/\s*END\b;?(?:$|\s)',
+            _make_goto_noop,
             result, flags=re.IGNORECASE
         )
 
-        # NULL statement → comment
-        result = re.sub(r'^\s*NULL\s*;\s*$', '-- NULL;', result, flags=re.MULTILINE)
+        # NULL statement → valid T-SQL no-op (comment-only body is invalid in IF blocks)
+        result = re.sub(r'^\s*NULL\s*;\s*$', '    PRINT \'\';  -- NULL (no-op)', result, flags=re.MULTILINE | re.IGNORECASE)
+
+        # SSMA converts Oracle NULL; statement to DECLARE @db_null_statement int.
+        # This is also not valid as an IF-branch body. Replace with a no-op.
+        result = re.sub(
+            r'\bDECLARE\s+@db_null_statement\s+\w+\s*;?',
+            "PRINT '';  -- NULL (no-op)",
+            result, flags=re.IGNORECASE
+        )
 
         # PRAGMA → comment out
         result = re.sub(
@@ -226,6 +293,67 @@ class SyntaxRule(ConversionRule):
             '[MERGE]',
             result, flags=re.IGNORECASE
         )
+
+        # ---------------------------------------------------------
+        # Bug 3B: BIT variable used as bare IF condition (error 4145)
+        # Oracle BOOLEAN maps to T-SQL BIT, but T-SQL requires explicit comparison.
+        # IF @var BEGIN → IF @var <> 0 BEGIN
+        # ---------------------------------------------------------
+        result = re.sub(
+            r'\bIF\s+(@\w+)\s*\n(\s*)BEGIN\b',
+            r'IF \1 <> 0\n\2BEGIN',
+            result, flags=re.IGNORECASE
+        )
+        result = re.sub(
+            r'\bIF\s+\((@\w+)\)\s*\n(\s*)BEGIN\b',
+            r'IF (\1 <> 0)\n\2BEGIN',
+            result, flags=re.IGNORECASE
+        )
+
+        # ---------------------------------------------------------
+        # Bug 6: Bare [schema].[proc](...) as a statement — needs EXEC prefix.
+        # Cross-package calls converted from pkg.proc(...) may lack EXEC.
+        # Only applies to standalone statement lines (not SET/SELECT/RETURN/DECLARE context).
+        # ---------------------------------------------------------
+        def _add_exec_prefix(m):
+            indent_str = m.group(1)
+            schema_proc = m.group(2)
+            args = m.group(3).strip()
+            return f"{indent_str}EXEC {schema_proc} {args};"
+
+        result = re.sub(
+            r'^(\s*)(?!SET\b|SELECT\b|RETURN\b|DECLARE\b|--|\s*@|\s*/\*)(\[[\w_]+\]\.\[[\w_]+\])\(([^;]*)\)\s*;',
+            _add_exec_prefix,
+            result, flags=re.IGNORECASE | re.MULTILINE
+        )
+
+        # Fix UpdateSupdtl: EXEC arg 'string' + ERROR_NUMBER() is not valid T-SQL syntax.
+        # In T-SQL, EXEC positional args cannot be expressions; pre-declare a variable.
+        result = re.sub(
+            r"(\n(\s*)EXEC\s+\[[\w_]+\]\.\[[\w_]+\][^\n]*,\s*\n)(\s*)(('(?:[^']|'')*')\s*\+\s*ERROR_NUMBER\s*\(\s*\))\s*;",
+            lambda m: (
+                f"\n{m.group(2)}DECLARE @__errmsg NVARCHAR(MAX) = {m.group(5)}"
+                f" + CAST(ERROR_NUMBER() AS NVARCHAR(10));"
+                f"{m.group(1)}{m.group(3)}@__errmsg;"
+            ),
+            result, flags=re.IGNORECASE
+        )
+
+        # ---------------------------------------------------------
+        # Bug 1: END; immediately before ELSE → remove semicolon.
+        # Occurs when an inner IF-ELSE block closes with END; but an outer ELSE follows.
+        # T-SQL requires END (no semicolon) before ELSE.
+        # Applied iteratively since nested patterns may need multiple passes.
+        # ---------------------------------------------------------
+        for _ in range(5):
+            result_new = re.sub(
+                r'\bEND\s*;\s*(\n[ \t]*(?:--[^\n]*\n[ \t]*)*)(\bELSE\b)',
+                r'END\n\1\2',
+                result, flags=re.IGNORECASE
+            )
+            if result_new == result:
+                break
+            result = result_new
 
         return result
 
@@ -554,7 +682,9 @@ class SyntaxRule(ConversionRule):
             else:
                 # Check if this starts a multi-line IF or ELSIF (no THEN on this line)
                 kw_match = re.match(r'(\s*)(IF|ELSIF)\s+(.*)', line, re.IGNORECASE)
-                if kw_match and not upper.endswith(' THEN') and not upper.endswith('\tTHEN') and upper != 'THEN':
+                rest_upper = kw_match.group(3).upper() if kw_match else ''
+                if (kw_match and not upper.endswith(' THEN') and not upper.endswith('\tTHEN')
+                        and upper != 'THEN' and ' THEN' not in rest_upper):
                     kw_indent = kw_match.group(1)
                     keyword = kw_match.group(2).upper()
                     rest = kw_match.group(3).strip()
@@ -668,32 +798,65 @@ class SyntaxRule(ConversionRule):
                     i += 1
                     continue
 
+            # ELSE body; (inline single-statement ELSE — Oracle allows "else stmt;" on one line)
+            # Distinguish from CASE ELSE by requiring the body to end with ';' (not 'END;').
+            else_inline = re.match(r'ELSE\s+(.+;\s*)$', stripped, re.IGNORECASE)
+            if else_inline:
+                body = else_inline.group(1).strip()
+                # Avoid matching CASE ELSE value END; patterns
+                body_upper = body.upper().rstrip('; \t')
+                if not body_upper.endswith('END'):
+                    result_lines.append(f"{indent}END")
+                    result_lines.append(f"{indent}ELSE")
+                    result_lines.append(f"{indent}BEGIN")
+                    result_lines.append(f"{indent}    {body}")
+                    i += 1
+                    continue
+
             # ELSE (standalone, at start of line - not inline CASE ELSE)
             # Check if we're inside a CASE expression by counting CASE/END pairs
             # in recent lines. If inside CASE, don't convert ELSE.
-            if re.match(r'ELSE\s*$', upper):
-                # Look back to see if we're inside a CASE block
-                case_depth = 0
+            if re.match(r'ELSE\s*(?:--.*)?$', upper):
+                # If the previous significant line is END;/END TRY/END CATCH, we are
+                # definitely at procedure statement level (not inside a SQL CASE expression).
+                # Skip the CASE heuristic and always inject END ELSE BEGIN.
+                prev_significant = None
+                for j in range(len(result_lines) - 1, max(-1, len(result_lines) - 10), -1):
+                    s = result_lines[j].strip()
+                    if s and not s.startswith('--') and not s.startswith('/*'):
+                        prev_significant = s.upper()
+                        break
+                force_not_in_case = bool(
+                    prev_significant and re.match(r'END\s*(TRY|CATCH|;|$)', prev_significant)
+                )
+
                 in_case = False
-                for j in range(len(result_lines) - 1, max(-1, len(result_lines) - 50), -1):
-                    prev_upper = result_lines[j].strip().upper()
-                    # Count END (CASE closers)
-                    if re.match(r'END\b', prev_upper) and not re.match(r'END\s*(IF|LOOP|TRY|CATCH)\b', prev_upper):
-                        case_depth += 1
-                    # Count CASE openers (may be preceded by (, SELECT, etc.)
-                    if re.search(r'\bCASE\b', prev_upper) and not re.search(r'\bEND\s+CASE\b', prev_upper):
-                        if case_depth > 0:
-                            case_depth -= 1
-                        else:
-                            in_case = True
-                            break
+                if not force_not_in_case:
+                    # Look back to see if we're inside a CASE block.
+                    # Count inline END occurrences to track balanced CASE...END pairs.
+                    case_depth = 0
+                    for j in range(len(result_lines) - 1, max(-1, len(result_lines) - 50), -1):
+                        prev_upper = result_lines[j].strip().upper()
+                        # Count ALL END occurrences (including inline CASE closers)
+                        # but exclude END TRY/CATCH/IF/LOOP which are structural, not CASE closers
+                        all_ends = len(re.findall(r'\bEND\b', prev_upper))
+                        excl_ends = len(re.findall(r'\bEND\s+(IF|LOOP|TRY|CATCH)\b', prev_upper))
+                        case_depth += max(0, all_ends - excl_ends)
+                        # Count CASE openers (may be preceded by (, SELECT, etc.)
+                        if re.search(r'\bCASE\b', prev_upper) and not re.search(r'\bEND\s+CASE\b', prev_upper):
+                            if case_depth > 0:
+                                case_depth -= 1
+                            else:
+                                in_case = True
+                                break
+
                 if in_case:
                     # Inside CASE — pass through as CASE ELSE
                     result_lines.append(line)
                     i += 1
                     continue
                 result_lines.append(f"{indent}END")
-                result_lines.append(f"{indent}ELSE")
+                result_lines.append(f"{indent}{stripped}")  # preserve trailing comment
                 result_lines.append(f"{indent}BEGIN")
                 i += 1
                 continue
@@ -705,19 +868,28 @@ class SyntaxRule(ConversionRule):
         return '\n'.join(result_lines)
 
     def _convert_for_loop(self, source: str, ctx: ConversionContext) -> str:
-        """Convert FOR i IN 1..n LOOP → DECLARE + WHILE."""
+        """Convert FOR i IN start..end LOOP → DECLARE + WHILE.
+
+        Handles both simple identifiers and expressions as loop bounds,
+        e.g. FOR i IN 0..TO_NUMBER(n) LOOP or FOR i IN 1..nCnt LOOP.
+        """
         def replace_for(m):
             var = m.group(1)
-            start = m.group(2)
-            end = m.group(3)
+            start = m.group(2).strip()
+            end = m.group(3).strip()
+            # If end is not a plain integer or simple @variable, cast to INT
+            if not re.match(r'^(\d+|@\w+)$', end):
+                end = f"CAST({end} AS INT)"
             return (
                 f"DECLARE @{var} INT = {start};\n"
                 f"WHILE @{var} <= {end}\n"
                 f"BEGIN"
             )
 
+        # Match FOR var IN start..end LOOP where start/end can be expressions.
+        # Use a non-greedy match for end, anchored by the LOOP keyword.
         result = re.sub(
-            r'\bFOR\s+(\w+)\s+IN\s+(\w+)\s*\.\.\s*(\w+)\s+LOOP',
+            r'\bFOR\s+(\w+)\s+IN\s+([\w@]+)\s*\.\.\s*(.+?)\s+LOOP\b',
             replace_for,
             source, flags=re.IGNORECASE
         )
@@ -918,8 +1090,8 @@ class SyntaxRule(ConversionRule):
                 and bare aliases after ) cause syntax errors.
                 """
                 col = col.strip()
-                # Remove AS alias
-                col = re.sub(r'\s+AS\s+\w+\s*$', '', col,
+                # Remove AS alias (with optional space before AS, e.g. ")AS alias" or ") AS alias")
+                col = re.sub(r'\s*AS\s+\w+\s*$', '', col,
                              flags=re.IGNORECASE | re.DOTALL).rstrip()
                 # Remove bare alias after closing paren: SUM(x) alias → SUM(x)
                 col = re.sub(r'(\))\s+\w+\s*$', r'\1', col, flags=re.DOTALL)
