@@ -36,6 +36,11 @@ class SyntaxRule(ConversionRule):
         # Standalone assignment: @var = value; → SET @var = value;
         result = self._add_set_keyword(result)
 
+        # Strip /*INTO var1, var2*/ block comments — Oracle developers comment out
+        # the INTO clause to convert a SELECT INTO statement into a cursor query.
+        # These become unclosed block comments after SELECT INTO conversion runs.
+        result = re.sub(r'/\*\s*INTO\b[\s\S]*?\*/', '', result, flags=re.IGNORECASE)
+
         # SELECT ... INTO var1, var2 FROM ... → SELECT @var1 = col1, @var2 = col2 FROM ...
         result = self._convert_select_into(result)
 
@@ -144,11 +149,12 @@ class SyntaxRule(ConversionRule):
         )
 
         # offrec_ovrtrans cursor3 CTE: nested derived tables missing aliases
-        # Fix 1: ) immediately before GROUP BY (innermost derived table)
+        # Fix 1: ) on its own line immediately before GROUP BY (innermost derived table).
+        # Require ) to be at start of line to avoid matching function-call parens in WHERE clauses.
         result = re.sub(
-            r'\)\s*\n(\s*)(group\s+by\b)',
-            r') AS __grp_d\n\1\2',
-            result, flags=re.IGNORECASE
+            r'^(\s*)\)\s*\n(\s*)(group\s+by\b)',
+            r'\1) AS __grp_d\n\2\3',
+            result, flags=re.IGNORECASE | re.MULTILINE
         )
         # Fix 2: ) where rnk = 1 → ) AS __outer_d where rnk = 1 (outer derived table)
         result = re.sub(
