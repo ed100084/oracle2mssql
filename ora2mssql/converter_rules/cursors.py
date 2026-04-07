@@ -11,9 +11,9 @@ class CursorRule(ConversionRule):
         result = source
 
         # CURSOR declaration: CURSOR name IS [comments...] SELECT/WITH → DECLARE name CURSOR FOR SELECT/WITH
-        # Handle IS followed by optional comment lines before SELECT or WITH
+        # Handle IS followed by optional comment lines or block comments before SELECT or WITH
         result = re.sub(
-            r'\bCURSOR\s+(\w+)\s+IS\s*(?:\s*--[^\n]*\n)*\s*((?:SELECT|WITH)\b)',
+            r'\bCURSOR\s+(\w+)\s+IS\s*(?:(?:\s*--[^\n]*\n)|(?:\s*/\*[\s\S]*?\*/\s*)|\s)*?((?:SELECT|WITH)\b)',
             r'DECLARE \1 CURSOR LOCAL FAST_FORWARD FOR \2',
             result, flags=re.IGNORECASE
         )

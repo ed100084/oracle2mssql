@@ -33,6 +33,14 @@ class SyntaxRule(ConversionRule):
         # Variable declarations: add DECLARE and @ prefix
         result = self._convert_variable_declarations(result, ctx)
 
+        # Fix: @colname in INSERT column list → colname (column names must not have @)
+        # Variable substitution may have incorrectly prefixed column names that share a name with a param/var.
+        result = re.sub(
+            r'(INSERT\s+INTO\s+\w+\s*\()([^;]*?)(\)\s*\n?\s*VALUES)',
+            lambda m: m.group(1) + re.sub(r'@(\w+)', r'\1', m.group(2)) + m.group(3),
+            result, flags=re.IGNORECASE | re.DOTALL
+        )
+
         # Standalone assignment: @var = value; → SET @var = value;
         result = self._add_set_keyword(result)
 
@@ -89,10 +97,52 @@ class SyntaxRule(ConversionRule):
         result = self._convert_connect_by(result, ctx)
 
         # Oracle comma-join mixed with ANSI JOIN → CROSS JOIN
-        # Pattern: ",\n  tablename alias\n  WHERE" → "CROSS JOIN tablename alias\n  WHERE"
+        # Pattern: ",\n  tablename alias\n  WHERE/CROSS JOIN" → "CROSS JOIN tablename alias\n  ..."
+        # Apply twice to handle 3+ comma-joined tables (ta, tb, tc → CROSS JOIN tb CROSS JOIN tc)
+        _comma_join_pat = re.compile(
+            r',\s*\n(\s*)(\w+)\s+(\w+)\s*\n(\s*(?:WHERE\b|CROSS\s+JOIN\b))',
+            re.IGNORECASE
+        )
+        result = _comma_join_pat.sub(r'\nCROSS JOIN \2 \3\n\4', result)
+        result = _comma_join_pat.sub(r'\nCROSS JOIN \2 \3\n\4', result)
+
+        # Oracle inline derived table: FROM (subquery)\n WHERE outer_filter
+        # T-SQL requires an alias. Only add when the WHERE block is followed by
+        # UNION ALL (non-last UNION member) or ") alias" (last member closing the outer subquery).
+        _union_derived_ctr = [0]
+        def _add_union_derived_alias(m):
+            # Don't add alias if ) closes a scalar subquery in an UPDATE SET clause.
+            # Check the line immediately before the matched ) for a SET col = ( pattern.
+            before = result[:m.start()]
+            last_newline = before.rfind('\n')
+            prev_line = before[last_newline + 1:] if last_newline >= 0 else before
+            if re.search(r'\bSET\s+\w+\s*=\s*\(', prev_line, re.IGNORECASE):
+                return m.group(0)  # No change
+            _union_derived_ctr[0] += 1
+            return f") AS __ud{_union_derived_ctr[0]}\n{m.group(1)}WHERE"
+        # Use [^;]* to prevent crossing statement boundaries (avoid matching across procedures).
+        # The ") alias" can appear mid-line (e.g. "AND ... ) ta"), so don't require \n before it.
         result = re.sub(
-            r',\s*\n(\s*)(\w+)\s+(\w+)\s*\n(\s*WHERE\b)',
-            r'\nCROSS JOIN \2 \3\n\4',
+            r'\)\s*\n(\s*)WHERE\b(?=[^;]*(?:\n\s*UNION\s+ALL|\)\s*[A-Za-z]))',
+            _add_union_derived_alias,
+            result, flags=re.IGNORECASE | re.DOTALL
+        )
+
+        # Fix B: FROM (SELECT...) without alias at end of statement → add AS __dcN alias.
+        # T-SQL requires aliases on all derived tables. Uses balanced-paren counting to
+        # handle arbitrary nesting depth (e.g. FORMAT(ISNULL(...))).
+        result = self._fix_derived_table_aliases(result)
+
+        # Fix C: outer FROM subquery where inner WHERE closes on ) and outer WHERE follows.
+        # Pattern: line starting with WHERE ... ) \n outer WHERE
+        # This catches e.g. WHERE emp_no = @pempno)\nWHERE FORMAT(...)
+        _od_ctr = [0]
+        def _add_outer_subq_alias(m):
+            _od_ctr[0] += 1
+            return f"{m.group(1)}) AS __od{_od_ctr[0]}\n{m.group(2)}WHERE"
+        result = re.sub(
+            r'(?m)^([ \t]+WHERE\b[^\n]*)\)\s*\n(\s*)WHERE\b',
+            _add_outer_subq_alias,
             result, flags=re.IGNORECASE
         )
 
@@ -256,9 +306,10 @@ class SyntaxRule(ConversionRule):
             result, flags=re.MULTILINE | re.IGNORECASE
         )
         # UTL_SMTP / UTL_* procedure calls (may span multiple lines)
+        # Comment each line individually so continuation lines are also commented out
         result = re.sub(
             r'^\s*utl_\w+\.\w+\s*\(.*?\)\s*;',
-            lambda m: f"    -- {MANUAL_REVIEW_TAG} {m.group(0).strip()}",
+            lambda m: "\n".join(f"    -- {MANUAL_REVIEW_TAG} {line.strip()}" for line in m.group(0).split('\n') if line.strip()),
             result, flags=re.MULTILINE | re.IGNORECASE | re.DOTALL
         )
         # Multi-line UTL calls: utl_smtp.func(arg,\n  arg2);
@@ -274,6 +325,15 @@ class SyntaxRule(ConversionRule):
             result, flags=re.MULTILINE | re.IGNORECASE
         )
 
+        # T-SQL rejects BEGIN...END blocks that contain only whitespace or line comments.
+        # Add PRINT no-op to ensure at least one executable statement in the block.
+        # Must run AFTER UTL_* comment-out so comment-only IF bodies are detected.
+        result = re.sub(
+            r'(?m)^([ \t]*)(BEGIN)\s*\n((?:[ \t]*(?:--[^\n]*)?\n)*)([ \t]*)(END\b(?!\s+TRY\b|\s+CATCH\b))',
+            r"\1\2\n\3\4PRINT '';  -- no-op\n\4\5",
+            result, flags=re.IGNORECASE
+        )
+
         # END procedure_name; → END; (remove trailing identifier after END)
         result = re.sub(
             r'\bEND\s+(?!IF\b|LOOP\b|CASE\b|TRY\b|CATCH\b|ELSE\b)(\w+)\s*;',
@@ -281,12 +341,22 @@ class SyntaxRule(ConversionRule):
             result, flags=re.IGNORECASE
         )
 
-        # Oracle labels: <<label>> → label:
-        result = re.sub(
-            r'<<(\w+)>>',
-            r'\1:',
-            result
-        )
+        # Oracle labels: <<label>> → label:  (deduplicate within each GO batch)
+        # Labels in different SPs don't conflict, so reset counter at each GO boundary.
+        go_sep = re.compile(r'^GO\s*$', re.MULTILINE)
+        batches = go_sep.split(result)
+        processed_batches = []
+        for batch in batches:
+            _lbl_counts: dict[str, int] = {}
+            def _unique_label(m, _c=_lbl_counts):
+                name = m.group(1)
+                count = _c.get(name, 0) + 1
+                _c[name] = count
+                if count == 1:
+                    return f"{name}:"
+                return f"{name}_{count}:"
+            processed_batches.append(re.sub(r'<<(\w+)>>', _unique_label, batch))
+        result = 'GO\n'.join(processed_batches)
 
         # ROLLBACK WORK → ROLLBACK
         result = re.sub(r'\bROLLBACK\s+WORK\b', 'ROLLBACK', result, flags=re.IGNORECASE)
@@ -327,8 +397,12 @@ class SyntaxRule(ConversionRule):
             args = m.group(3).strip()
             return f"{indent_str}EXEC {schema_proc} {args};"
 
+        # Negative lookbehind: skip if previous line ends with operator (+,-,*,/,=,,),
+        # which means [schema].[proc]( is a continuation of an expression, not a standalone call.
+        # Use (?:'[^']*'|[^;])* for args to skip over string literals containing ';' so the
+        # statement-terminating ';' is not mistakenly matched inside a string literal.
         result = re.sub(
-            r'^(\s*)(?!SET\b|SELECT\b|RETURN\b|DECLARE\b|--|\s*@|\s*/\*)(\[[\w_]+\]\.\[[\w_]+\])\(([^;]*)\)\s*;',
+            r'(?<![+\-*/=,(]\n)^(\s*)(?!SET\b|SELECT\b|RETURN\b|DECLARE\b|--|\s*@|\s*/\*)(\[[\w_]+\]\.\[[\w_]+\])\(((?:\'[^\']*\'|[^;])*)\)\s*;',
             _add_exec_prefix,
             result, flags=re.IGNORECASE | re.MULTILINE
         )
@@ -361,6 +435,15 @@ class SyntaxRule(ConversionRule):
                 break
             result = result_new
 
+        # Pre-declare expression args in EXEC calls (T-SQL EXEC positional args
+        # cannot be expressions like @var + 'str' or 'a' + 'b').
+        result = self._fix_exec_expressions(result)
+
+        # Wrap top-level TRY/CATCH in BEGIN...END
+        # T-SQL fails to parse procedures where DECLARE statements appear
+        # directly before BEGIN TRY without an enclosing BEGIN...END.
+        result = self._wrap_top_level_try_catch(result)
+
         return result
 
     def _add_set_keyword(self, source: str) -> str:
@@ -378,15 +461,24 @@ class SyntaxRule(ConversionRule):
         )
         lines = source.split('\n')
         result_lines = []
+        last_nonempty_stripped = ''
         for line in lines:
             stripped = line.strip()
             # Match: @var = something (with or without ; on this line)
+            # Skip if current line ends with AND/OR (is itself a condition continuation)
+            # Skip if previous non-empty line ends with AND/OR (we're inside a multi-line condition)
+            curr_ends_cond = bool(re.search(r'\b(AND|OR)\s*$', stripped, re.IGNORECASE))
+            prev_ends_cond = bool(re.search(r'\b(AND|OR)\s*$', last_nonempty_stripped, re.IGNORECASE))
             if (re.match(r'@\w+\s*=\s*.+', stripped) and
-                    not stripped.upper().startswith(_EXCLUDED)):
+                    not stripped.upper().startswith(_EXCLUDED) and
+                    not curr_ends_cond and
+                    not prev_ends_cond):
                 indent = line[:len(line) - len(line.lstrip())]
                 result_lines.append(f"{indent}SET {stripped}")
             else:
                 result_lines.append(line)
+            if stripped:
+                last_nonempty_stripped = stripped
         return '\n'.join(result_lines)
 
     def _convert_parameters(self, source: str, ctx: ConversionContext) -> str:
@@ -1058,6 +1150,27 @@ class SyntaxRule(ConversionRule):
             replace_pkg_call,
             source, flags=re.IGNORECASE
         )
+
+        # Also handle no-argument package calls: pkg.proc; → EXEC [schema].[proc];
+        def replace_pkg_call_noargs(m):
+            indent = m.group(1)
+            pkg_name = m.group(2)
+            proc_name = m.group(3)
+            skip_prefixes = {'SYS', 'DBA', 'ALL', 'USER', 'V$', 'GV$',
+                             'DBMS_OUTPUT', 'DBMS_LOB', 'DBMS_SQL', 'DBMS_LOCK',
+                             'UTL_FILE', 'UTL_HTTP'}
+            if pkg_name.upper() in skip_prefixes:
+                return m.group(0)
+            from ..utils import sanitize_name
+            schema = ctx.schema_mapping.get(pkg_name.upper(), sanitize_name(pkg_name))
+            ctx.package_refs.add(pkg_name.upper())
+            return f"{indent}EXEC [{schema}].[{proc_name}];"
+
+        result = re.sub(
+            r'^([ \t]*)([A-Z]\w*_PKG)\.(\w+)\s*;',
+            replace_pkg_call_noargs,
+            result, flags=re.IGNORECASE | re.MULTILINE
+        )
         return result
 
     def _convert_select_into(self, source: str) -> str:
@@ -1163,6 +1276,294 @@ class SyntaxRule(ConversionRule):
             result_parts.append(pattern.sub(replace_select_into, part))
 
         return ''.join(result_parts)
+
+    def _fix_derived_table_aliases(self, source: str) -> str:
+        """Add AS __dcN alias to FROM (...); patterns that are missing aliases.
+
+        T-SQL requires aliases on all derived tables in FROM clauses.
+        Uses balanced-paren + string-literal counting for arbitrary nesting depth.
+        Applies when matching ')' is immediately followed by ';' (no alias present).
+        """
+        result = []
+        i = 0
+        dc_ctr = 0
+        from_pat = re.compile(r'\bFROM\s*\(', re.IGNORECASE)
+
+        while i < len(source):
+            m = from_pat.search(source, i)
+            if not m:
+                result.append(source[i:])
+                break
+
+            # Emit text before 'FROM ('
+            result.append(source[i:m.end()])
+
+            # Find matching ')' using balanced-paren counting, skipping string literals
+            open_pos = m.end() - 1  # position of '('
+            j = open_pos + 1
+            depth = 1
+            in_str = False
+            while j < len(source) and depth > 0:
+                c = source[j]
+                if in_str:
+                    if c == "'":
+                        if j + 1 < len(source) and source[j + 1] == "'":
+                            j += 2  # skip escaped ''
+                            continue
+                        in_str = False
+                else:
+                    if c == "'":
+                        in_str = True
+                    elif c == '(':
+                        depth += 1
+                    elif c == ')':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                j += 1
+
+            # j is at the matching ')'
+            content = source[m.end():j]  # content inside FROM (...)
+
+            # Check: is the subquery SELECT-based (not a function call like IN (1,2,3))
+            is_select = bool(re.match(r'\s*(?:SELECT|WITH)\b', content, re.IGNORECASE))
+            # Check: does the matching ')' immediately precede ';' (no alias after it)
+            after = source[j + 1:j + 20]
+            ends_stmt = bool(re.match(r'\s*;', after))
+
+            if is_select and ends_stmt:
+                dc_ctr += 1
+                result.append(f"{content}) AS __dc{dc_ctr}")
+                i = j + 1  # skip past ')'
+            else:
+                # Not a target — emit content and ')' normally
+                result.append(content)
+                result.append(')')
+                i = j + 1
+
+        return ''.join(result)
+
+    def _fix_exec_expressions(self, source: str) -> str:
+        """Pre-declare expression args in EXEC [schema].[proc] calls.
+
+        T-SQL EXEC positional args cannot be expressions (e.g. @var + 'str').
+        Finds each EXEC statement, parses args (string-literal-aware), and
+        pre-declares any expression arg as a local variable.
+        """
+        _ctr = [0]
+        exec_pat = re.compile(r'\bEXEC\s+(\[[\w_]+\]\.\[[\w_]+\])\s+', re.IGNORECASE)
+
+        result = []
+        pos = 0
+
+        while pos < len(source):
+            m = exec_pat.search(source, pos)
+            if not m:
+                result.append(source[pos:])
+                break
+
+            # Emit text before EXEC
+            result.append(source[pos:m.start()])
+
+            # Find the ';' ending this EXEC (string-literal-aware)
+            j = m.end()
+            in_str = False
+            stmt_end = None
+            while j < len(source):
+                c = source[j]
+                if in_str:
+                    if c == "'":
+                        if j + 1 < len(source) and source[j + 1] == "'":
+                            j += 2
+                            continue
+                        in_str = False
+                else:
+                    if c == "'":
+                        in_str = True
+                    elif c == ';':
+                        stmt_end = j
+                        break
+                j += 1
+
+            if stmt_end is None:
+                result.append(source[m.start():])
+                pos = len(source)
+                break
+
+            args_raw = source[m.end():stmt_end]
+
+            # Split args by ',' (string-literal and paren-depth aware)
+            args = []
+            current = []
+            in_s = False
+            depth = 0
+            k = 0
+            while k < len(args_raw):
+                c = args_raw[k]
+                if in_s:
+                    current.append(c)
+                    if c == "'":
+                        if k + 1 < len(args_raw) and args_raw[k + 1] == "'":
+                            current.append("'")
+                            k += 2
+                            continue
+                        in_s = False
+                else:
+                    if c == "'":
+                        in_s = True
+                        current.append(c)
+                    elif c == '(':
+                        depth += 1
+                        current.append(c)
+                    elif c == ')':
+                        depth -= 1
+                        current.append(c)
+                    elif c == ',' and depth == 0:
+                        args.append(''.join(current))
+                        current = []
+                        k += 1
+                        continue
+                    else:
+                        current.append(c)
+                k += 1
+            if current:
+                args.append(''.join(current))
+
+            # Check each arg for '+' outside string literals / parens
+            decls = []
+            new_args = []
+            changed = False
+            for arg in args:
+                arg_str = arg.strip()
+                # Detect '+' outside strings and parens
+                has_plus = False
+                in_s2 = False
+                depth2 = 0
+                for c in arg_str:
+                    if in_s2:
+                        if c == "'":
+                            in_s2 = False
+                    else:
+                        if c == "'":
+                            in_s2 = True
+                        elif c == '(':
+                            depth2 += 1
+                        elif c == ')':
+                            depth2 -= 1
+                        elif c == '+' and depth2 == 0:
+                            has_plus = True
+                            break
+                if has_plus:
+                    _ctr[0] += 1
+                    var = f"@__xe{_ctr[0]}"
+                    decls.append(f"DECLARE {var} NVARCHAR(MAX) = {arg_str};")
+                    new_args.append(var)
+                    changed = True
+                else:
+                    new_args.append(arg_str)
+
+            if changed:
+                # Find indentation of EXEC line
+                line_start = source.rfind('\n', 0, m.start())
+                exec_line_prefix = source[line_start + 1:m.start()]
+                indent = re.match(r'^[ \t]*', exec_line_prefix).group(0)
+                decl_block = '\n'.join(f"{indent}{d}" for d in decls)
+                new_args_str = ', '.join(new_args)
+                result.append(f"{decl_block}\n{indent}{m.group(0)}{new_args_str};")
+            else:
+                result.append(source[m.start():stmt_end + 1])
+
+            pos = stmt_end + 1
+
+        return ''.join(result)
+
+    def _wrap_top_level_try_catch(self, source: str) -> str:
+        """Wrap top-level TRY/CATCH in BEGIN...END when DECLARE precedes BEGIN TRY.
+
+        T-SQL stored procedures fail to parse (error 102 near ';' and 'CATCH')
+        when DECLARE statements appear directly before BEGIN TRY without an
+        enclosing BEGIN...END block. SSMA always adds this wrapper.
+        """
+        lines = source.split('\n')
+        result = []
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip().upper()
+
+            # Detect the AS line belonging to a CREATE OR ALTER PROCEDURE/FUNCTION
+            if stripped == 'AS':
+                is_proc_as = any(
+                    re.match(r'\s*CREATE\s+OR\s+ALTER\s+(PROCEDURE|FUNCTION)\b', lines[j], re.IGNORECASE)
+                    for j in range(max(0, i - 10), i + 1)
+                )
+                if is_proc_as:
+                    result.append(line)
+                    i += 1
+                    # Collect DECLARE/comment/empty lines after AS
+                    declare_block = []
+                    j = i
+                    begin_try_idx = None
+                    while j < len(lines):
+                        s = lines[j].strip()
+                        su = s.upper()
+                        if not s or s.startswith('--'):
+                            declare_block.append(lines[j])
+                            j += 1
+                        elif su.startswith('DECLARE ') or su == 'DECLARE':
+                            declare_block.append(lines[j])
+                            j += 1
+                        elif re.match(r'BEGIN\s+TRY\b', s, re.IGNORECASE):
+                            begin_try_idx = j
+                            break
+                        else:
+                            break  # outer BEGIN or something else — don't wrap
+
+                    if begin_try_idx is None:
+                        result.extend(declare_block)
+                        i = j
+                        continue
+
+                    # Find the matching END CATCH for the outermost BEGIN TRY
+                    # Track nesting: BEGIN TRY increments, END TRY decrements
+                    # When depth reaches 0 after END TRY, the next END CATCH is ours
+                    end_catch_idx = None
+                    depth = 0
+                    for k in range(begin_try_idx, len(lines)):
+                        if re.match(r'^\s*GO\s*$', lines[k]):
+                            break
+                        ks = lines[k].strip()
+                        if re.match(r'BEGIN\s+TRY\b', ks, re.IGNORECASE):
+                            depth += 1
+                        elif re.match(r'END\s+TRY\b', ks, re.IGNORECASE):
+                            depth -= 1
+                        elif re.match(r'END\s+CATCH\b', ks, re.IGNORECASE) and depth == 0:
+                            end_catch_idx = k
+                            break
+
+                    if end_catch_idx is None:
+                        result.extend(declare_block)
+                        i = j
+                        continue
+
+                    # Determine indent from BEGIN TRY line
+                    bt_line = lines[begin_try_idx]
+                    indent = bt_line[:len(bt_line) - len(bt_line.lstrip())]
+
+                    # Output: declare block + BEGIN wrapper + TRY body + END wrapper
+                    result.extend(declare_block)
+                    result.append(f'{indent}BEGIN')
+                    for idx in range(begin_try_idx, end_catch_idx + 1):
+                        result.append(lines[idx])
+                    result.append(f'{indent}END')
+                    i = end_catch_idx + 1
+                    continue
+
+            result.append(line)
+            i += 1
+
+        return '\n'.join(result)
 
     def _convert_exec_immediate(self, m) -> str:
         """Convert EXECUTE IMMEDIATE with USING clause."""

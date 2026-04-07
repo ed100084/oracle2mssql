@@ -72,14 +72,15 @@ class PackageRule(ConversionRule):
                 body = self._strip_function_invalid_features(body, proc_name, ctx)
 
             # Schema-qualify intra-package function/procedure calls
+            # Negative lookbehind: skip if preceded by '.' (pkg_name.func) or ']' ([schema].[func])
             for sub_name in sub_names:
                 body = re.sub(
-                    r'(?<!\[)\b' + re.escape(sub_name) + r'\s*\(',
+                    r'(?<![.\]])\b' + re.escape(sub_name) + r'\s*\(',
                     f'[{schema}].[{sub_name}](',
                     body, flags=re.IGNORECASE
                 )
                 params = re.sub(
-                    r'(?<!\[)\b' + re.escape(sub_name) + r'\s*\(',
+                    r'(?<![.\]])\b' + re.escape(sub_name) + r'\s*\(',
                     f'[{schema}].[{sub_name}](',
                     params, flags=re.IGNORECASE
                 )
