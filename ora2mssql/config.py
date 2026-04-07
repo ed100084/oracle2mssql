@@ -62,6 +62,7 @@ class ConversionConfig(BaseModel):
     skip_objects: list[str] = []
     include_objects: list[str] = []
     output_dir: str = "output"
+    engine: str = "regex"  # "regex" (existing) or "ast" (ANTLR4-based)
 
 
 class TestingConfig(BaseModel):

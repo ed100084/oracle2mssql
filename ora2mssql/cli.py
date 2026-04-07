@@ -59,17 +59,26 @@ def analyze(ctx):
 
 
 @main.command()
+@click.option("--engine", type=click.Choice(["regex", "ast"]), default=None,
+              help="Conversion engine: 'regex' (default) or 'ast' (ANTLR4)")
 @click.pass_context
-def convert(ctx):
+def convert(ctx, engine):
     """Convert PL/SQL to T-SQL."""
     config = load_config(ctx.obj["config_path"])
-    from .converter import run_convert
-    from .reporter import print_conversion_summary
+    if engine:
+        config.conversion.engine = engine
 
-    console.print("[bold]Converting PL/SQL to T-SQL...[/bold]")
-    results = run_convert(config)
+    console.print(f"[bold]Converting PL/SQL to T-SQL (engine={config.conversion.engine})...[/bold]")
 
-    print_conversion_summary(config)
+    if config.conversion.engine == "ast":
+        from .ast_converter import run_ast_convert
+        results = run_ast_convert(config)
+        console.print(f"[green]AST conversion: {sum(1 for r in results if r.success)}/{len(results)} routines[/green]")
+    else:
+        from .converter import run_convert
+        from .reporter import print_conversion_summary
+        results = run_convert(config)
+        print_conversion_summary(config)
 
 
 @main.command()
