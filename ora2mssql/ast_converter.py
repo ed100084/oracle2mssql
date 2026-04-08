@@ -519,7 +519,12 @@ class AstConverter:
         cursor_names = {d['name'] for d in decls if d.get('is_cursor')}
         all_var_names = {d['name'] for d in decls if not d.get('is_cursor')} | param_names
 
-        # 3. Apply @ prefix to cursor queries (they reference local vars)
+        # 3. Apply built-in function transforms to cursor SELECT queries
+        for d in decls:
+            if d.get('is_cursor') and d.get('cursor_query'):
+                d['cursor_query'] = transformer._convert_functions(d['cursor_query'])
+
+        # 3b. Apply @ prefix to cursor queries (they reference local vars)
         decls = self._prefix_cursor_queries(decls, all_var_names)
 
         # 4. Apply @ prefix to default values in DECLARE
@@ -662,12 +667,17 @@ class AstConverter:
                 )
                 result = text_before + try_block + text_after
             elif begin_pos is None:
-                # No matching BEGIN — bare EXCEPTION (outer procedure level)
+                # No matching BEGIN — bare EXCEPTION (outer procedure level).
+                # Wrap the entire before_exc in BEGIN TRY ... END TRY.
                 when_text = after_exc
                 # Remove trailing END; if present
                 when_text = re.sub(r'\bEND\s*;?\s*$', '', when_text, flags=re.IGNORECASE).rstrip()
                 catch_body = self._parse_when_clauses(when_text)
-                result = before_exc.rstrip() + f"\nEND TRY\nBEGIN CATCH\n{catch_body}\nEND CATCH"
+                result = (
+                    "BEGIN TRY\n"
+                    + before_exc.rstrip()
+                    + f"\nEND TRY\nBEGIN CATCH\n{catch_body}\nEND CATCH"
+                )
                 break
             else:
                 # end_pos not found — break to avoid infinite loop
@@ -678,48 +688,76 @@ class AstConverter:
         return result
 
     def _find_matching_begin_pos(self, text: str) -> Optional[int]:
-        """Find the position of the last unmatched BEGIN keyword in text."""
-        # Walk through text tracking BEGIN/END depth
-        # Returns position of the BEGIN that would match a following EXCEPTION
-        tokens_re = re.compile(r'\b(BEGIN|END)\b', re.IGNORECASE)
-        positions = []
-        depth = 0
+        """Find the position of the last unmatched BEGIN keyword in text.
 
-        # Walk forward, tracking BEGIN positions
-        begin_stack = []
+        Handles CASE...END SQL expressions so they don't confuse BEGIN/END tracking.
+        Uses a unified stack: both BEGIN and CASE push; END pops from top.
+        END IF / END LOOP are ignored (they close IF/LOOP, not BEGIN/CASE blocks).
+        """
+        # Order matters: END IF / END LOOP / END CASE must be matched before bare END
+        tokens_re = re.compile(
+            r'\b(END\s+IF|END\s+LOOP|END\s+CASE|BEGIN|CASE|END)\b',
+            re.IGNORECASE
+        )
+        # Stack entries: ('BEGIN', pos) or ('CASE', pos)
+        stack: list[tuple[str, int]] = []
+
         for m in tokens_re.finditer(text):
-            kw = m.group(1).upper()
+            kw = ' '.join(m.group(1).upper().split())  # normalise whitespace
             if kw == 'BEGIN':
-                begin_stack.append(m.start())
-            elif kw == 'END' and begin_stack:
-                begin_stack.pop()
+                stack.append(('BEGIN', m.start()))
+            elif kw == 'CASE':
+                stack.append(('CASE', m.start()))
+            elif kw in ('END IF', 'END LOOP', 'END CASE'):
+                # Consume the corresponding non-BEGIN opener if present
+                if stack and stack[-1][0] in ('CASE',):
+                    stack.pop()
+                # END IF / END LOOP don't pop BEGIN entries
+            elif kw == 'END':
+                # Pops whatever is on top (BEGIN block or CASE expression)
+                if stack:
+                    stack.pop()
 
-        if begin_stack:
-            return begin_stack[-1]  # Last unmatched BEGIN
+        # Return position of last unmatched BEGIN (ignore unmatched CASEs)
+        for kind, pos in reversed(stack):
+            if kind == 'BEGIN':
+                return pos
         return None
 
     def _find_closing_end(self, text: str) -> tuple[Optional[int], int]:
-        """Find the first END keyword at depth 0 in text after EXCEPTION."""
-        depth = 0
-        tokens_re = re.compile(r'\b(BEGIN|END)\b', re.IGNORECASE)
+        """Find the first END keyword at depth 0 in text after EXCEPTION.
+
+        Accounts for CASE...END expressions so they don't short-circuit the search.
+        """
+        # Order matters: END IF / END LOOP / END CASE before bare END
+        tokens_re = re.compile(
+            r'\b(END\s+IF|END\s+LOOP|END\s+CASE|BEGIN|CASE|END)\b',
+            re.IGNORECASE
+        )
+        stack: list[str] = []  # 'BEGIN' or 'CASE'
+
         for m in tokens_re.finditer(text):
-            kw = m.group(1).upper()
+            kw = ' '.join(m.group(1).upper().split())
             if kw == 'BEGIN':
-                depth += 1
+                stack.append('BEGIN')
+            elif kw == 'CASE':
+                stack.append('CASE')
+            elif kw in ('END IF', 'END LOOP', 'END CASE'):
+                if stack and stack[-1] == 'CASE':
+                    stack.pop()
             elif kw == 'END':
-                if depth == 0:
-                    # Check if followed by semicolon
+                if stack:
+                    stack.pop()
+                else:
+                    # depth 0 — this is the closing END we are looking for
                     end_len = m.end() - m.start()
-                    # Skip 'END name;' or 'END;'
                     rest = text[m.end():].lstrip()
                     if rest.startswith(';'):
                         return m.start(), end_len + 1 + (len(text[m.end():]) - len(rest))
                     elif re.match(r'\w+\s*;', rest):
-                        # END name;
                         semi = rest.index(';')
                         return m.start(), m.end() - m.start() + (len(text[m.end():]) - len(rest)) + semi + 1
                     return m.start(), end_len
-                depth -= 1
         return None, 0
 
     def _parse_when_clauses(self, text: str) -> str:
@@ -842,10 +880,25 @@ class AstConverter:
             r'\s*;',
             re.IGNORECASE
         )
-        for m in var_pattern.finditer(text):
+        # Strip cursor bodies from text before var matching (prevents FROM/WHERE etc. being parsed as vars)
+        text_no_cursors = cursor_pattern.sub('', text)
+
+        SQL_KEYWORDS = {
+            'CURSOR', 'BEGIN', 'END', 'DECLARE', 'EXCEPTION', 'PROCEDURE', 'FUNCTION',
+            'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'IN', 'BETWEEN', 'LIKE',
+            'GROUP', 'ORDER', 'BY', 'HAVING', 'UNION', 'INTERSECT', 'MINUS',
+            'INSERT', 'UPDATE', 'DELETE', 'INTO', 'VALUES', 'SET',
+            'CREATE', 'ALTER', 'DROP', 'TABLE', 'VIEW', 'INDEX',
+            'IF', 'THEN', 'ELSE', 'ELSIF', 'LOOP', 'FOR', 'WHILE', 'RETURN',
+            'OPEN', 'FETCH', 'CLOSE', 'COMMIT', 'ROLLBACK', 'NULL',
+            'IS', 'AS', 'OF', 'ON', 'JOIN', 'LEFT', 'RIGHT', 'INNER', 'OUTER', 'FULL',
+            'CASE', 'WHEN', 'THEN', 'ELSE', 'END',
+        }
+
+        for m in var_pattern.finditer(text_no_cursors):
             name = m.group(1).upper()
-            # Skip keywords
-            if name in ('CURSOR', 'BEGIN', 'END', 'DECLARE', 'EXCEPTION', 'PROCEDURE', 'FUNCTION'):
+            # Skip SQL keywords
+            if name in SQL_KEYWORDS:
                 continue
             oracle_type = m.group(2).strip()
             default_val = m.group(3).strip() if m.group(3) else None
@@ -871,25 +924,28 @@ class AstConverter:
         if not decls:
             return ""
 
-        declare_lines = []
+        # Variables and exceptions first, cursors last.
+        # Cursors may reference local variables in their SELECT, so variables must be declared first.
+        var_lines = []
+        cursor_lines = []
         for d in decls:
             name = d['name']
             if d.get('is_cursor'):
                 query = d.get('cursor_query', '').strip()
-                declare_lines.append(f"DECLARE {name} CURSOR FOR")
+                cursor_lines.append(f"DECLARE {name} CURSOR FOR")
                 if query:
-                    declare_lines.append(f"    {query}")
+                    cursor_lines.append(f"    {query};")
             elif d.get('is_exception'):
-                declare_lines.append(f"DECLARE @{name} INT = 0  -- exception flag")
+                var_lines.append(f"DECLARE @{name} INT = 0;  -- exception flag")
             else:
                 mssql_type = d['mssql_type']
                 line = f"DECLARE @{name} {mssql_type}"
                 if d.get('default'):
                     dv = _transform_default(d['default'])
                     line += f" = {dv}"
-                declare_lines.append(line)
+                var_lines.append(line + ";")
 
-        return '\n'.join(declare_lines)
+        return '\n'.join(var_lines + cursor_lines)
 
     def _strip_routine_header(self, body_text: str) -> str:
         """Strip the procedure/function header lines before the first BEGIN."""
@@ -915,10 +971,11 @@ class AstConverter:
         """Fix Oracle IF/THEN/ELSIF/END IF → T-SQL IF/BEGIN/END."""
         result = source
         # IF ... THEN → IF ... BEGIN
+        # Only replace THEN at end of line (with optional comment) — preserves CASE WHEN ... THEN value
         result = re.sub(
-            r'\bTHEN\b(?!\s*BEGIN)',
-            'BEGIN',
-            result, flags=re.IGNORECASE
+            r'\bTHEN\b([ \t]*(?:--[^\n]*)?)$',
+            r'BEGIN\1',
+            result, flags=re.IGNORECASE | re.MULTILINE
         )
         # ELSIF → END\nELSE IF
         result = re.sub(
@@ -926,9 +983,16 @@ class AstConverter:
             'END\nELSE IF',
             result, flags=re.IGNORECASE
         )
+        # ELSE (not ELSE IF) at end of a line → END\nELSE\nBEGIN
+        # This closes the previous BEGIN block and opens a new one for ELSE body.
+        result = re.sub(
+            r'^(\s*)ELSE\b(?!\s*IF\b)([ \t]*(?:--[^\n]*)?)$',
+            r'\1END\n\1ELSE\n\1BEGIN\2',
+            result, flags=re.IGNORECASE | re.MULTILINE
+        )
         # END IF → END
         result = re.sub(
-            r'\bEND\s+IF\b\s*;?',
+            r'\bEND\s+IF\b[ \t]*;?',
             'END',
             result, flags=re.IGNORECASE
         )
@@ -986,17 +1050,19 @@ class AstConverter:
             result, flags=re.IGNORECASE
         )
 
-        # Simple LOOP → WHILE 1=1 BEGIN
+        # END LOOP → END  (must come BEFORE bare LOOP substitution)
+        # Use \n to preserve line separation; only eat the semicolon, not newlines
         result = re.sub(
-            r'(?<!\w)LOOP\b(?!\s+\w)',
-            'WHILE 1=1 BEGIN',
+            r'\bEND\s+LOOP\b[ \t]*;?',
+            'END',
             result, flags=re.IGNORECASE
         )
 
-        # END LOOP → END
+        # Simple bare LOOP → WHILE 1=1 BEGIN
+        # (all FOR/WHILE ... LOOP patterns already handled above)
         result = re.sub(
-            r'\bEND\s+LOOP\b\s*(?:;\s*)?',
-            'END',
+            r'\bLOOP\b',
+            'WHILE 1=1 BEGIN',
             result, flags=re.IGNORECASE
         )
 
@@ -1067,11 +1133,19 @@ class AstConverter:
         # Strip Oracle named parameter syntax: param => value → value
         tsql = self._strip_named_params(tsql)
 
-        # Convert Oracle NULL statement
+        # Add missing aliases to unaliased derived tables in FROM clauses
+        # T-SQL requires aliases; Oracle does not. Pattern: FROM (subquery) ; or FROM (subquery)\n
+        tsql = self._add_derived_table_aliases(tsql)
+
+        # Convert Oracle NULL statement (standalone NULL; → comment)
         tsql = re.sub(r'(?m)^\s*NULL\s*;\s*$', '-- NULL (no-op)', tsql, flags=re.IGNORECASE)
 
-        # Convert GOTO → -- GOTO (T-SQL has GOTO but limited use)
-        # Keep GOTO as-is since T-SQL supports it
+        # Convert SQLCODE / SQLERRM
+        tsql = re.sub(r'\bSQLCODE\b', 'ERROR_NUMBER()', tsql, flags=re.IGNORECASE)
+        tsql = re.sub(r'\bSQLERRM\b', 'ERROR_MESSAGE()', tsql, flags=re.IGNORECASE)
+
+        # Convert Oracle block labels <<label>> → label: (T-SQL GOTO label)
+        tsql = re.sub(r'<<(\w+)>>', r'\1:', tsql)
 
         # Convert RAISE_APPLICATION_ERROR
         tsql = re.sub(
@@ -1079,6 +1153,114 @@ class AstConverter:
             lambda m: f"RAISERROR({m.group(2)}, 16, 1)",
             tsql, flags=re.IGNORECASE
         )
+
+        # Deduplicate T-SQL labels: if a label name appears more than once,
+        # suffix each occurrence (and its matching GOTO) with _1, _2, ...
+        tsql = self._deduplicate_labels(tsql)
+
+        return tsql
+
+    def _deduplicate_labels(self, tsql: str) -> str:
+        """Rename duplicate T-SQL label definitions and their GOTOs.
+
+        T-SQL error 132: label name already declared in the same batch.
+        Oracle allows the same label name in different loop scopes; T-SQL does not.
+
+        Strategy:
+          1. Scan for all label definitions (word followed by colon on its own line).
+          2. For labels that appear more than once, number them sequentially.
+          3. For each occurrence, find the GOTO targeting that label between
+             the previous occurrence (or start) and the current label position,
+             and suffix the GOTO with the same number.
+        """
+        # Find all label definitions: lines like "   LabelName:"
+        label_def_re = re.compile(r'^([ \t]*)(\w+):([ \t]*)$', re.MULTILINE)
+
+        # Count occurrences of each label name
+        from collections import Counter
+        label_counts: Counter = Counter()
+        for m in label_def_re.finditer(tsql):
+            label_counts[m.group(2).upper()] += 1
+
+        # Only process labels that appear more than once
+        dup_labels = {name for name, cnt in label_counts.items() if cnt > 1}
+        if not dup_labels:
+            return tsql
+
+        for label_name in sorted(dup_labels):
+            # Find all definition positions (case-insensitive)
+            pattern = re.compile(
+                r'^([ \t]*)(' + re.escape(label_name) + r'):([ \t]*)$',
+                re.MULTILINE | re.IGNORECASE
+            )
+            positions = [(m.start(), m.end(), m) for m in pattern.finditer(tsql)]
+            if len(positions) <= 1:
+                continue
+
+            # Process in reverse order so positions don't shift
+            # For each label occurrence (by position, ascending), assign number 1..N
+            # and update the most recent preceding GOTO for this label
+            goto_re = re.compile(
+                r'\bGOTO\s+(' + re.escape(label_name) + r')\b',
+                re.IGNORECASE
+            )
+
+            # Build list of all label and GOTO positions with their type
+            events = []
+            for start, end, m in positions:
+                events.append(('label', start, end, m))
+            for m in goto_re.finditer(tsql):
+                events.append(('goto', m.start(), m.end(), m))
+            events.sort(key=lambda e: e[1])
+
+            # Assign suffix numbers: each label gets the next number,
+            # GOTOs get the same number as the NEXT label after them
+            label_num = 0
+            # First pass: assign numbers to labels
+            label_nums = {}  # position → number
+            for kind, start, end, m in events:
+                if kind == 'label':
+                    label_num += 1
+                    label_nums[start] = label_num
+
+            # Second pass: match GOTOs to next label
+            goto_nums = {}  # position → number
+            label_positions = sorted(label_nums.keys())
+            for kind, start, end, m in events:
+                if kind == 'goto':
+                    # Find the next label after this GOTO
+                    next_label = next((p for p in label_positions if p > start), None)
+                    if next_label is not None:
+                        goto_nums[start] = label_nums[next_label]
+                    else:
+                        # No next label — use the last label
+                        goto_nums[start] = label_num
+
+            # Apply replacements in reverse order to preserve positions
+            all_replacements = []
+            for kind, start, end, m in events:
+                if kind == 'label':
+                    n = label_nums[start]
+                    suffix = f"_{n}"
+                    # Replace the label name in the match
+                    all_replacements.append((
+                        m.start(2), m.end(2),
+                        m.group(2) + suffix
+                    ))
+                elif kind == 'goto' and start in goto_nums:
+                    n = goto_nums[start]
+                    suffix = f"_{n}"
+                    # Replace the label reference in GOTO
+                    all_replacements.append((
+                        m.start(1), m.end(1),
+                        m.group(1) + suffix
+                    ))
+
+            all_replacements.sort(key=lambda r: r[0], reverse=True)
+            tsql_list = list(tsql)
+            for rep_start, rep_end, rep_text in all_replacements:
+                tsql_list[rep_start:rep_end] = list(rep_text)
+            tsql = ''.join(tsql_list)
 
         return tsql
 
@@ -1090,8 +1272,8 @@ class AstConverter:
         tsql = re.sub(r'(\w+)\s*%\s*FOUND', '@@FETCH_STATUS = 0', tsql, flags=re.IGNORECASE)
         # %ROWCOUNT → @@ROWCOUNT
         tsql = re.sub(r'(\w+)\s*%\s*ROWCOUNT', '@@ROWCOUNT', tsql, flags=re.IGNORECASE)
-        # %ISOPEN → (not easily converted, mark)
-        tsql = re.sub(r'(\w+)\s*%\s*ISOPEN', '1 /*%ISOPEN*/', tsql, flags=re.IGNORECASE)
+        # %ISOPEN → 1=1 (always true; T-SQL cursor open state not easily trackable)
+        tsql = re.sub(r'(\w+)\s*%\s*ISOPEN', '1=1 /*%ISOPEN*/', tsql, flags=re.IGNORECASE)
 
         # FETCH cursor_name INTO var1, var2 → FETCH NEXT FROM cursor_name INTO @var1, @var2
         def fix_fetch(m):
@@ -1142,11 +1324,69 @@ class AstConverter:
             )
             return f"SELECT {assignments}\n    FROM {from_clause}"
 
-        tsql = re.sub(
-            r'\bSELECT\s+((?:(?!FROM|INTO)[^;])+?)\s+INTO\s+((?:@?\w+\s*,?\s*)+)\s+FROM\s+(.+?)(?=;|\nWHERE|\nGROUP|\nHAVING|\nORDER|\nFOR)',
-            fix_select_into,
-            tsql, flags=re.IGNORECASE | re.DOTALL
-        )
+        # Two-pass approach: find SELECT...INTO...FROM blocks line by line
+        # to avoid catastrophic backtracking on large SQL.
+        lines = tsql.split('\n')
+        out_lines = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # Look for SELECT ... INTO on this line or spanning next lines
+            if re.match(r'\s*SELECT\b', line, re.IGNORECASE):
+                # Accumulate lines until we find INTO and FROM or hit ;
+                block_lines = [line]
+                j = i + 1
+                found_into = 'INTO' in line.upper()
+                found_from = 'FROM' in line.upper() and found_into
+                while j < len(lines) and not found_from:
+                    bl = lines[j]
+                    block_lines.append(bl)
+                    bl_up = bl.upper().strip()
+                    if not found_into and 'INTO' in bl_up:
+                        found_into = True
+                    if found_into and 'FROM' in bl_up:
+                        found_from = True
+                        break
+                    if ';' in bl:
+                        break
+                    j += 1
+
+                block = '\n'.join(block_lines)
+                # Try single-line pattern on the accumulated block
+                m = re.match(
+                    r'(\s*SELECT\s+)([\s\S]+?)\s+INTO\s+((?:@?\w+\s*(?:,\s*@?\w+\s*)*)?)\s+FROM\b([\s\S]*)',
+                    block, re.IGNORECASE
+                )
+                if m and found_into and found_from:
+                    select_list = m.group(2).strip()
+                    into_vars = m.group(3).strip()
+                    from_rest = 'FROM' + m.group(4)
+                    sel_cols = [c.strip() for c in _split_params(select_list)]
+                    into_v = [v.strip() for v in _split_params(into_vars)]
+                    # Strip column aliases (trailing bare word not preceded by operator)
+                    _alias_re = re.compile(r'^(.*\))\s+\w+$', re.DOTALL)
+                    def strip_alias(col):
+                        col = col.strip()
+                        am = _alias_re.match(col)
+                        return am.group(1).strip() if am else col
+                    sel_cols = [strip_alias(c) for c in sel_cols]
+                    if len(sel_cols) == len(into_v) and into_v:
+                        assignments = ', '.join(
+                            f"{v} = {c}" if v.startswith('@') else f"@{v} = {c}"
+                            for v, c in zip(into_v, sel_cols)
+                        )
+                        out_lines.append(m.group(1) + assignments)
+                        out_lines.append('    ' + from_rest)
+                    else:
+                        out_lines.append(f"SELECT {select_list} /*INTO {into_vars}*/ FROM{m.group(4)}")
+                    i = j + 1
+                    continue
+                else:
+                    out_lines.append(line)
+            else:
+                out_lines.append(line)
+            i += 1
+        tsql = '\n'.join(out_lines)
         return tsql
 
     def _strip_named_params(self, tsql: str) -> str:
@@ -1157,11 +1397,83 @@ class AstConverter:
         # Match: identifier => expression (in function call context)
         # Remove the identifier => part
         tsql = re.sub(
-            r'\b@?\w+\s*=>\s*',
+            r'@?\w+\s*=>\s*',
             '',
             tsql
         )
         return tsql
+
+    def _add_derived_table_aliases(self, tsql: str) -> str:
+        """Add missing aliases to unaliased derived tables.
+
+        T-SQL requires FROM (subquery) AS alias; Oracle does not.
+        Finds FROM ( ... ) with no following alias and inserts AS _dt_N.
+        Recursively processes nested subqueries so all levels get aliases.
+        """
+        # SQL keywords that may follow a derived table closing paren instead of an alias
+        _KW = {
+            'WHERE', 'ON', 'GROUP', 'ORDER', 'HAVING', 'UNION', 'INTERSECT', 'EXCEPT',
+            'MINUS', 'JOIN', 'LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS', 'FULL',
+            'AND', 'OR', 'NOT', 'BEGIN', 'END', 'GO', 'ROLLBACK', 'COMMIT', 'SET',
+            'RETURN', 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'IF', 'ELSE',
+            'WHILE', 'FOR', 'FETCH', 'CLOSE', 'OPEN', 'DEALLOCATE',
+        }
+        from_pat = re.compile(r'\bFROM\s*\(', re.IGNORECASE)
+
+        # Use a mutable counter shared across all recursive calls
+        counter_ref = [0]
+
+        def _process(text: str) -> str:
+            result = []
+            i = 0
+            while i < len(text):
+                m = from_pat.search(text, i)
+                if not m:
+                    result.append(text[i:])
+                    break
+
+                result.append(text[i:m.end()])  # up to and including '('
+                start = m.end()
+
+                # Walk to find matching closing paren
+                depth = 1
+                j = start
+                in_str = False
+                str_char = ''
+                while j < len(text) and depth > 0:
+                    ch = text[j]
+                    if in_str:
+                        if ch == str_char:
+                            in_str = False
+                    elif ch in ("'", '"'):
+                        in_str, str_char = True, ch
+                    elif ch == '(':
+                        depth += 1
+                    elif ch == ')':
+                        depth -= 1
+                    j += 1
+
+                # Recursively process the inner content (excluding closing ')')
+                inner_content = text[start:j - 1]  # content between '(' and ')'
+                processed_inner = _process(inner_content)
+                result.append(processed_inner)
+                result.append(')')  # re-add the closing paren
+
+                # Check what follows the closing ')'
+                rest = text[j:]
+                m2 = re.match(r'^(\s*)(AS\s+)?(\w+|\[[\w\s]+\])?', rest, re.IGNORECASE)
+                following_word = (m2.group(3) or '').upper() if m2 else ''
+
+                if not following_word or following_word in _KW or following_word in ('', ';'):
+                    # No alias — insert one
+                    counter_ref[0] += 1
+                    result.append(f' AS _dt{counter_ref[0]}')
+
+                i = j
+
+            return ''.join(result)
+
+        return _process(tsql)
 
     def _fix_function_declare_placement(self, tsql: str) -> str:
         """T-SQL scalar functions require DECLARE inside BEGIN..END (not between AS and BEGIN)."""
@@ -1184,16 +1496,24 @@ class AstConverter:
         if as_idx is None or begin_idx is None:
             return tsql
 
-        # Collect DECLARE lines between AS and BEGIN
+        # Collect DECLARE lines between AS and BEGIN.
+        # Lines that are part of a CURSOR FOR declaration (spanning multiple lines)
+        # must also go into declare_section.
         declare_section = []
         other_between = []
+        in_cursor_body = False  # True while inside a multi-line cursor SELECT
         for i in range(as_idx + 1, begin_idx):
             line = lines[i]
             stripped = line.strip().upper()
-            if stripped.startswith('DECLARE') or stripped == '':
+            if stripped.startswith('DECLARE') or stripped == '' or in_cursor_body:
                 declare_section.append(line)
+                if re.search(r'CURSOR\s+FOR\s*$', stripped):
+                    in_cursor_body = True   # next lines are cursor SELECT
+                if in_cursor_body and ';' in line:
+                    in_cursor_body = False  # cursor SELECT ended
             else:
                 other_between.append(line)
+                in_cursor_body = False
 
         if not declare_section:
             return tsql
@@ -1211,7 +1531,7 @@ class AstConverter:
 # Integration with existing pipeline
 # ---------------------------------------------------------------------------
 
-def run_ast_convert(config: AppConfig) -> list[ConversionResult]:
+def run_ast_convert(config: AppConfig, package_filter: str | None = None) -> list[ConversionResult]:
     """Run AST-based conversion on all extracted package bodies."""
     from .utils import sanitize_name
 
@@ -1224,6 +1544,7 @@ def run_ast_convert(config: AppConfig) -> list[ConversionResult]:
     converted_dir = ensure_dir(output_dir / "converted_ast")
 
     skip_set = set(s.upper() for s in config.conversion.skip_objects)
+    pkg_filter = package_filter.upper() if package_filter else None
 
     for obj in manifest["objects"]:
         owner = obj["owner"]
@@ -1231,6 +1552,8 @@ def run_ast_convert(config: AppConfig) -> list[ConversionResult]:
         obj_type = obj["type"]
 
         if name.upper() in skip_set:
+            continue
+        if pkg_filter and name.upper() != pkg_filter:
             continue
         if obj_type != "PACKAGE BODY":
             continue

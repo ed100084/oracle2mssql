@@ -61,8 +61,10 @@ def analyze(ctx):
 @main.command()
 @click.option("--engine", type=click.Choice(["regex", "ast"]), default=None,
               help="Conversion engine: 'regex' (default) or 'ast' (ANTLR4)")
+@click.option("--package", "package_name", default=None,
+              help="Convert specific package only (e.g. EHRPHRA3_PKG)")
 @click.pass_context
-def convert(ctx, engine):
+def convert(ctx, engine, package_name):
     """Convert PL/SQL to T-SQL."""
     config = load_config(ctx.obj["config_path"])
     if engine:
@@ -72,7 +74,7 @@ def convert(ctx, engine):
 
     if config.conversion.engine == "ast":
         from .ast_converter import run_ast_convert
-        results = run_ast_convert(config)
+        results = run_ast_convert(config, package_filter=package_name)
         console.print(f"[green]AST conversion: {sum(1 for r in results if r.success)}/{len(results)} routines[/green]")
     else:
         from .converter import run_convert
@@ -120,14 +122,18 @@ def test(ctx, mode):
 
 @main.command(name="sp-check")
 @click.option("--package", "package_name", default=None, help="Check specific package only (e.g. EHRPHRA3_PKG)")
+@click.option("--engine", type=click.Choice(["regex", "ast"]), default=None,
+              help="Which conversion output to check: 'regex' (converted/) or 'ast' (converted_ast/)")
 @click.pass_context
-def sp_check(ctx, package_name):
+def sp_check(ctx, package_name, engine):
     """Check syntax of each SP/Function individually (PARSEONLY, no data written)."""
     from pathlib import Path
     config = load_config(ctx.obj["config_path"])
     from .deployer import get_mssql_connection, check_sps_in_file
 
-    converted_dir = Path(config.conversion.output_dir) / "converted"
+    effective_engine = engine or config.conversion.engine or "regex"
+    subdir = "converted_ast" if effective_engine == "ast" else "converted"
+    converted_dir = Path(config.conversion.output_dir) / subdir
 
     console.print("[bold]Connecting to MSSQL for SP-level syntax check...[/bold]")
     try:

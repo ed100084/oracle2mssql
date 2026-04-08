@@ -47,6 +47,148 @@ def _oracle_fmt_to_net(oracle_fmt: str) -> str:
     return result
 
 
+def _split_args(s: str) -> list[str]:
+    """Split comma-separated args respecting nested parentheses and quotes."""
+    args = []
+    depth = 0
+    buf = []
+    in_str = False
+    str_char = ''
+    for ch in s:
+        if in_str:
+            buf.append(ch)
+            if ch == str_char:
+                in_str = False
+        elif ch in ("'", '"'):
+            in_str = True
+            str_char = ch
+            buf.append(ch)
+        elif ch == '(':
+            depth += 1
+            buf.append(ch)
+        elif ch == ')':
+            depth -= 1
+            buf.append(ch)
+        elif ch == ',' and depth == 0:
+            args.append(''.join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        args.append(''.join(buf).strip())
+    return args
+
+
+def _extract_func_args(s: str, start: int) -> tuple[str, int]:
+    """Extract the full argument string from pos start (after opening '(').
+    Returns (inner_content, end_pos) where end_pos is after the closing ')'.
+    """
+    depth = 1
+    j = start
+    in_str = False
+    str_char = ''
+    while j < len(s) and depth > 0:
+        ch = s[j]
+        if in_str:
+            if ch == str_char:
+                in_str = False
+        elif ch in ("'", '"'):
+            in_str, str_char = True, ch
+        elif ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        j += 1
+    return s[start:j - 1], j
+
+
+def _convert_func_calls(s: str, func_name: str, converter) -> str:
+    """Replace all occurrences of func_name(...) using a paren-aware extractor."""
+    result = []
+    i = 0
+    pat = re.compile(r'\b' + re.escape(func_name) + r'\s*\(', re.IGNORECASE)
+    while i < len(s):
+        m = pat.search(s, i)
+        if not m:
+            result.append(s[i:])
+            break
+        result.append(s[i:m.start()])
+        inner, end = _extract_func_args(s, m.end())
+        result.append(converter(inner))
+        i = end
+    return ''.join(result)
+
+
+def _to_char_convert(inner: str) -> str:
+    args = _split_args(inner)
+    if len(args) >= 2:
+        expr = args[0].strip()
+        fmt = args[1].strip().strip("'\"")
+        net_fmt = _oracle_fmt_to_net(fmt)
+        return f"FORMAT({expr}, '{net_fmt}')"
+    return f"CAST({inner.strip()} AS NVARCHAR)"
+
+
+def _to_date_convert(inner: str) -> str:
+    args = _split_args(inner)
+    expr = args[0].strip() if args else inner.strip()
+    return f"CONVERT(DATETIME2, {expr})"
+
+
+def _to_number_convert(inner: str) -> str:
+    return f"CAST({inner.strip()} AS DECIMAL(38,10))"
+
+
+def _convert_decode_in_text(s: str) -> str:
+    """Convert DECODE(expr, v1, r1, ..., default) → CASE WHEN expr=v1 THEN r1 ... END."""
+    result = []
+    i = 0
+    pattern = re.compile(r'\bDECODE\s*\(', re.IGNORECASE)
+    while i < len(s):
+        m = pattern.search(s, i)
+        if not m:
+            result.append(s[i:])
+            break
+        result.append(s[i:m.start()])
+        # Find matching closing paren
+        start = m.end()
+        depth = 1
+        j = start
+        in_str = False
+        str_char = ''
+        while j < len(s) and depth > 0:
+            ch = s[j]
+            if in_str:
+                if ch == str_char:
+                    in_str = False
+            elif ch in ("'", '"'):
+                in_str = True
+                str_char = ch
+            elif ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            j += 1
+        inner = s[start:j - 1]
+        args = _split_args(inner)
+        if len(args) < 3:
+            result.append(f"DECODE({inner})")
+        else:
+            expr = args[0]
+            pairs = args[1:]
+            case_parts = [f"CASE"]
+            k = 0
+            while k + 1 < len(pairs):
+                case_parts.append(f" WHEN {expr} = {pairs[k]} THEN {pairs[k+1]}")
+                k += 2
+            if k < len(pairs):
+                case_parts.append(f" ELSE {pairs[k]}")
+            case_parts.append(" END")
+            result.append(''.join(case_parts))
+        i = j
+    return ''.join(result)
+
+
 class SyntaxTransformer:
     """
     Applies Oracle → MSSQL syntactic transformations to a routine's token stream.
@@ -399,40 +541,21 @@ class SyntaxTransformer:
         # NVL2(expr, val_if_not_null, val_if_null) → IIF(expr IS NOT NULL, val_if_not_null, val_if_null)
         s = re.sub(r'\bNVL2\s*\(', '/*NVL2*/ IIF(', s, flags=re.IGNORECASE)
 
-        # DECODE(expr, v1, r1, v2, r2, ..., default) → IIF chains (complex; mark)
-        s = re.sub(r'\bDECODE\s*\(', '/*DECODE→IIF*/ DECODE(', s, flags=re.IGNORECASE)
+        # DECODE(expr, v1, r1, v2, r2, ..., default) → CASE WHEN expr=v1 THEN r1 ... ELSE default END
+        s = _convert_decode_in_text(s)
 
-        # TO_CHAR(date, 'format') → FORMAT(date, 'format')
-        def to_char_replace(m):
-            inner = m.group(1)
-            # Split on first comma
-            parts = inner.split(',', 1)
-            if len(parts) == 2:
-                expr = parts[0].strip()
-                fmt = parts[1].strip().strip("'\"")
-                net_fmt = _oracle_fmt_to_net(fmt)
-                return f"FORMAT({expr}, '{net_fmt}')"
-            return f"CAST({inner.strip()} AS NVARCHAR)"
-        s = re.sub(
-            r'\bTO_CHAR\s*\(([^)]+)\)',
-            to_char_replace,
-            s, flags=re.IGNORECASE
-        )
-
-        # TO_NUMBER(x) → CAST(x AS DECIMAL)
-        s = re.sub(r'\bTO_NUMBER\s*\(([^)]+)\)',
-                   lambda m: f"CAST({m.group(1)} AS DECIMAL(38,10))",
-                   s, flags=re.IGNORECASE)
-
-        # TO_DATE(expr, fmt) → CONVERT(DATETIME2, expr)
-        s = re.sub(r'\bTO_DATE\s*\(([^)]+)\)',
-                   lambda m: f"CONVERT(DATETIME2, {m.group(1).split(',')[0].strip()})",
-                   s, flags=re.IGNORECASE)
+        # TO_CHAR / TO_DATE / TO_NUMBER — use paren-aware extractor for nested calls
+        s = _convert_func_calls(s, 'TO_CHAR', _to_char_convert)
+        s = _convert_func_calls(s, 'TO_DATE', _to_date_convert)
+        s = _convert_func_calls(s, 'TO_NUMBER', _to_number_convert)
 
         # TRUNC(date) → CAST(date AS DATE)
         s = re.sub(r'\bTRUNC\s*\(([^,)]+)\)',
                    lambda m: f"CAST({m.group(1).strip()} AS DATE)",
                    s, flags=re.IGNORECASE)
+
+        # CEIL(x) → CEILING(x)
+        s = re.sub(r'\bCEIL\s*\(', 'CEILING(', s, flags=re.IGNORECASE)
 
         # LAST_DAY(date) → EOMONTH(date)
         s = re.sub(r'\bLAST_DAY\s*\(', 'EOMONTH(', s, flags=re.IGNORECASE)
@@ -507,6 +630,11 @@ class SyntaxTransformer:
             lambda m: f"PRINT {m.group(1)}",
             s, flags=re.IGNORECASE
         )
+
+        # IN 'value' without parentheses → IN ('value')
+        # Oracle allows both; T-SQL requires parentheses
+        s = re.sub(r"\bIN\s+'([^']*)'", r"IN ('\1')", s, flags=re.IGNORECASE)
+        s = re.sub(r'\bIN\s+(\d+)\b', r'IN (\1)', s, flags=re.IGNORECASE)
 
         # RAISE_APPLICATION_ERROR(num, msg) → RAISERROR(msg, 16, 1)
         def raise_app_error(m):
