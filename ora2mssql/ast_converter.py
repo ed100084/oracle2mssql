@@ -364,6 +364,11 @@ class AstConverter:
         token_stream.fill()
         all_tokens = token_stream.tokens  # list of Token objects
 
+        # Attach set of all intra-package routine names to each routine (for qualification)
+        all_routine_names = {r.name for r in routines}
+        for r in routines:
+            r._all_routine_names = all_routine_names
+
         # Step 5: Convert each routine
         for routine in routines:
             try:
@@ -474,8 +479,9 @@ class AstConverter:
         # Combine header + body
         tsql = f"{header}\n{body_tsql}\nGO\n"
 
-        # Final cleanup
-        tsql = self._final_cleanup(tsql, schema, pkg_name)
+        # Final cleanup — pass all routine names for intra-package qualification
+        all_routine_names = getattr(routine, '_all_routine_names', None)
+        tsql = self._final_cleanup(tsql, schema, pkg_name, all_routine_names)
 
         warnings: list[str] = []
         manual_review: list[str] = []
@@ -509,48 +515,73 @@ class AstConverter:
         # 2. Parse declarations from text
         decls = self._parse_declarations_from_text(declare_text)
 
-        # 3. Build DECLARE block (separate DECLARE per item)
+        # Separate cursors from regular vars
+        cursor_names = {d['name'] for d in decls if d.get('is_cursor')}
+        all_var_names = {d['name'] for d in decls if not d.get('is_cursor')} | param_names
+
+        # 3. Apply @ prefix to cursor queries (they reference local vars)
+        decls = self._prefix_cursor_queries(decls, all_var_names)
+
+        # 4. Apply @ prefix to default values in DECLARE
+        decls = self._prefix_declare_defaults(decls, all_var_names | param_names)
+
+        # 5. Build DECLARE block (separate DECLARE per item)
         declare_block = self._build_declare_block_text(decls, param_names)
 
-        # 4. body_text starts with BEGIN; strip inner content for transformation
+        # 6. body_text starts with BEGIN; strip inner content for transformation
         body_only = self._strip_routine_header(body_text)
-        # body_only = "BEGIN\n  ...\nEND name;"
-        # Strip outer BEGIN/END to get inner statements
         inner_body = self._strip_begin_end(body_only)
 
-        # 5. Apply built-in function transforms
+        # 7. Apply built-in function transforms
         transformed = transformer._convert_functions(inner_body)
 
-        # 6. Fix boolean literals
+        # 8. Fix boolean literals
         transformed = transformer._fix_boolean(transformed)
 
-        # 7. Convert string concatenation
+        # 9. Convert string concatenation
         transformed = transformed.replace('||', '+')
 
-        # 8. Convert EXCEPTION/WHEN → TRY/CATCH FIRST
+        # 10. Convert EXCEPTION/WHEN → TRY/CATCH FIRST
         # (must be before _fix_if_structure which converts THEN → BEGIN)
         transformed = self._convert_exception_block(transformed)
 
-        # 9. Convert := assignments → SET @var = ...
-        all_var_names = {d['name'] for d in decls} | param_names
+        # 11. Convert := assignments → SET @var = ...
         transformed = self._convert_assignments(transformed, all_var_names)
 
-        # 10. Add @ prefix to variables (after assignment conversion)
+        # 12. Add @ prefix to variables (exclude cursor names)
         transformed = self._add_var_prefix(transformed, all_var_names)
 
-        # 11. Fix IF/THEN/ELSIF/END IF structure
+        # 13. Fix IF/THEN/ELSIF/END IF structure
         transformed = self._fix_if_structure(transformed)
 
-        # 12. Fix LOOP / FOR LOOP / WHILE LOOP structure
+        # 14. Fix LOOP / FOR LOOP / WHILE LOOP / FOR i IN range structure
         transformed = self._fix_loop_structure(transformed)
 
-        # 13. Reassemble with DECLARE + BEGIN...END
+        # 15. Qualify intra-package function calls (e.g. f_hra4010_A → [schema].[f_hra4010_A])
+        # (done in _final_cleanup with schema info)
+
+        # 16. Reassemble with DECLARE + BEGIN...END
         if declare_block.strip():
             result = f"{declare_block}\nBEGIN\n{transformed}\nEND"
         else:
             result = f"BEGIN\n{transformed}\nEND"
 
         return result
+
+    def _prefix_cursor_queries(self, decls: list[dict], var_names: set[str]) -> list[dict]:
+        """Apply @ prefix to variable refs inside cursor SELECT queries."""
+        for d in decls:
+            if d.get('is_cursor') and d.get('cursor_query'):
+                d['cursor_query'] = self._add_var_prefix(d['cursor_query'], var_names)
+        return decls
+
+    def _prefix_declare_defaults(self, decls: list[dict], all_names: set[str]) -> list[dict]:
+        """Apply @ prefix to parameter/variable references in DECLARE default values."""
+        for d in decls:
+            if d.get('default'):
+                # Add @ to any bare identifier that matches a param/var name
+                d['default'] = self._add_var_prefix(d['default'], all_names)
+        return decls
 
     def _strip_begin_end(self, body_text: str) -> str:
         """Remove outer BEGIN...END from body text, preserving inner content."""
@@ -907,6 +938,47 @@ class AstConverter:
         """Fix Oracle LOOP/FOR LOOP/WHILE LOOP → T-SQL WHILE/BEGIN/END."""
         result = source
 
+        # FOR i IN lower..upper LOOP → DECLARE @i INT; SET @i = lower; WHILE @i <= upper BEGIN
+        def for_numeric_loop(m):
+            var = m.group(1)
+            lower = m.group(2).strip()
+            upper = m.group(3).strip()
+            return (f"DECLARE @{var} INT = {lower};\n"
+                    f"WHILE @{var} <= {upper} BEGIN")
+        result = re.sub(
+            r'\bFOR\s+(\w+)\s+IN\s+(\d+)\s*\.\.\s*(\d+)\s+LOOP\b',
+            for_numeric_loop,
+            result, flags=re.IGNORECASE
+        )
+
+        # FOR i IN expr1..expr2 LOOP (general expression)
+        def for_expr_loop(m):
+            var = m.group(1)
+            lower = m.group(2).strip()
+            upper = m.group(3).strip()
+            return (f"DECLARE @{var} INT = {lower};\n"
+                    f"WHILE @{var} <= {upper} BEGIN")
+        result = re.sub(
+            r'\bFOR\s+(\w+)\s+IN\s+(.+?)\s*\.\.\s*(.+?)\s+LOOP\b',
+            for_expr_loop,
+            result, flags=re.IGNORECASE
+        )
+
+        # FOR REVERSE loops
+        result = re.sub(
+            r'\bFOR\s+(\w+)\s+IN\s+REVERSE\s+(.+?)\s*\.\.\s*(.+?)\s+LOOP\b',
+            lambda m: (f"DECLARE @{m.group(1)} INT = {m.group(3).strip()};\n"
+                       f"WHILE @{m.group(1)} >= {m.group(2).strip()} BEGIN"),
+            result, flags=re.IGNORECASE
+        )
+
+        # FOR cursor loop → WHILE (fetch) BEGIN ... END  (mark for manual review)
+        result = re.sub(
+            r'\bFOR\s+(\w+)\s+IN\s+(\w+)\s+LOOP\b',
+            lambda m: f"/* TODO: FOR cursor loop {m.group(1)} IN {m.group(2)} */\nWHILE 1=1 BEGIN  -- fetch {m.group(2)}",
+            result, flags=re.IGNORECASE
+        )
+
         # WHILE condition LOOP → WHILE condition BEGIN
         result = re.sub(
             r'\b(WHILE\s+[^\n]+)\s+LOOP\b',
@@ -940,7 +1012,8 @@ class AstConverter:
 
         return result
 
-    def _final_cleanup(self, tsql: str, schema: str, pkg_name: str) -> str:
+    def _final_cleanup(self, tsql: str, schema: str, pkg_name: str,
+                       routine_names: Optional[set[str]] = None) -> str:
         """Final cleanup passes."""
         # Remove Oracle-specific end markers: END pkg_name;
         tsql = re.sub(
@@ -966,7 +1039,172 @@ class AstConverter:
         # Remove trailing semicolons on END statements
         tsql = re.sub(r'\bEND\s*;', 'END', tsql, flags=re.IGNORECASE)
 
+        # Qualify intra-package function/procedure calls
+        # e.g. f_hra4010_A(...) → [EHRPHRA3_PKG].[f_hra4010_A](...)
+        if routine_names:
+            for rname in sorted(routine_names, key=len, reverse=True):
+                # Only qualify bare calls (not already qualified)
+                pattern = r'(?<!\[)(?<!\.)(?<!\w)' + re.escape(rname) + r'(?!\w)(?=\s*\()'
+                replacement = f"[{schema}].[{rname}]"
+                tsql = re.sub(pattern, replacement, tsql, flags=re.IGNORECASE)
+
+        # pkg_name.routine → [schema].[routine]
+        tsql = re.sub(
+            re.escape(pkg_name) + r'\.' + r'(\w+)',
+            lambda m: f"[{schema}].[{m.group(1)}]",
+            tsql, flags=re.IGNORECASE
+        )
+
+        # Fix T-SQL function DECLARE inside functions (functions need DECLARE inside BEGIN)
+        tsql = self._fix_function_declare_placement(tsql)
+
+        # Convert Oracle cursor attributes
+        tsql = self._convert_cursor_syntax(tsql)
+
+        # Convert SELECT...INTO @var FROM → SELECT @var = ... FROM
+        tsql = self._convert_select_into(tsql)
+
+        # Strip Oracle named parameter syntax: param => value → value
+        tsql = self._strip_named_params(tsql)
+
+        # Convert Oracle NULL statement
+        tsql = re.sub(r'(?m)^\s*NULL\s*;\s*$', '-- NULL (no-op)', tsql, flags=re.IGNORECASE)
+
+        # Convert GOTO → -- GOTO (T-SQL has GOTO but limited use)
+        # Keep GOTO as-is since T-SQL supports it
+
+        # Convert RAISE_APPLICATION_ERROR
+        tsql = re.sub(
+            r'\bRAISE_APPLICATION_ERROR\s*\(\s*(-?\d+)\s*,\s*(.+?)\)',
+            lambda m: f"RAISERROR({m.group(2)}, 16, 1)",
+            tsql, flags=re.IGNORECASE
+        )
+
         return tsql
+
+    def _convert_cursor_syntax(self, tsql: str) -> str:
+        """Convert Oracle cursor syntax to T-SQL."""
+        # %NOTFOUND → @@FETCH_STATUS <> 0
+        tsql = re.sub(r'(\w+)\s*%\s*NOTFOUND', '@@FETCH_STATUS <> 0', tsql, flags=re.IGNORECASE)
+        # %FOUND → @@FETCH_STATUS = 0
+        tsql = re.sub(r'(\w+)\s*%\s*FOUND', '@@FETCH_STATUS = 0', tsql, flags=re.IGNORECASE)
+        # %ROWCOUNT → @@ROWCOUNT
+        tsql = re.sub(r'(\w+)\s*%\s*ROWCOUNT', '@@ROWCOUNT', tsql, flags=re.IGNORECASE)
+        # %ISOPEN → (not easily converted, mark)
+        tsql = re.sub(r'(\w+)\s*%\s*ISOPEN', '1 /*%ISOPEN*/', tsql, flags=re.IGNORECASE)
+
+        # FETCH cursor_name INTO var1, var2 → FETCH NEXT FROM cursor_name INTO @var1, @var2
+        def fix_fetch(m):
+            cursor_name = m.group(1)
+            vars_part = m.group(2)
+            return f"FETCH NEXT FROM {cursor_name} INTO {vars_part}"
+        tsql = re.sub(
+            r'\bFETCH\s+(\w+)\s+INTO\s+(.+?)(?=;|\n)',
+            fix_fetch,
+            tsql, flags=re.IGNORECASE
+        )
+
+        # OPEN cursor_name — already correct in T-SQL
+        # CLOSE cursor_name — already correct in T-SQL
+        # Add DEALLOCATE after CLOSE if missing
+        def add_deallocate(m):
+            cursor_name = m.group(1)
+            return f"CLOSE {cursor_name};\n    DEALLOCATE {cursor_name}"
+        tsql = re.sub(
+            r'\bCLOSE\s+(\w+)\s*;',
+            add_deallocate,
+            tsql, flags=re.IGNORECASE
+        )
+
+        return tsql
+
+    def _convert_select_into(self, tsql: str) -> str:
+        """Convert Oracle SELECT expr INTO @var FROM → T-SQL SELECT @var = expr FROM."""
+        # Pattern: SELECT expr1, expr2 INTO @var1, @var2 FROM ...
+        # This is complex for multiple columns. Handle single-column first.
+        def fix_select_into(m):
+            select_list = m.group(1).strip()
+            into_vars = m.group(2).strip()
+            from_clause = m.group(3)
+
+            # Split select list and into variables
+            sel_cols = [c.strip() for c in _split_params(select_list)]
+            into_v = [v.strip() for v in _split_params(into_vars)]
+
+            if len(sel_cols) != len(into_v):
+                # Can't match, leave with comment
+                return f"SELECT {select_list} /*INTO {into_vars}*/ FROM {from_clause}"
+
+            # Build T-SQL: SELECT @v1 = col1, @v2 = col2 FROM ...
+            assignments = ', '.join(
+                f"{v} = {c}" if v.startswith('@') else f"@{v} = {c}"
+                for v, c in zip(into_v, sel_cols)
+            )
+            return f"SELECT {assignments}\n    FROM {from_clause}"
+
+        tsql = re.sub(
+            r'\bSELECT\s+((?:(?!FROM|INTO)[^;])+?)\s+INTO\s+((?:@?\w+\s*,?\s*)+)\s+FROM\s+(.+?)(?=;|\nWHERE|\nGROUP|\nHAVING|\nORDER|\nFOR)',
+            fix_select_into,
+            tsql, flags=re.IGNORECASE | re.DOTALL
+        )
+        return tsql
+
+    def _strip_named_params(self, tsql: str) -> str:
+        """Strip Oracle named parameter syntax: func(param => value) → func(value).
+
+        In T-SQL, named parameters are not supported.
+        """
+        # Match: identifier => expression (in function call context)
+        # Remove the identifier => part
+        tsql = re.sub(
+            r'\b@?\w+\s*=>\s*',
+            '',
+            tsql
+        )
+        return tsql
+
+    def _fix_function_declare_placement(self, tsql: str) -> str:
+        """T-SQL scalar functions require DECLARE inside BEGIN..END (not between AS and BEGIN)."""
+        # Only applies to FUNCTION, not PROCEDURE
+        if not re.match(r'CREATE\s+OR\s+ALTER\s+FUNCTION', tsql.strip(), re.IGNORECASE):
+            return tsql
+
+        # Find the AS line
+        lines = tsql.split('\n')
+        as_idx = None
+        begin_idx = None
+        for i, line in enumerate(lines):
+            stripped = line.strip().upper()
+            if stripped == 'AS':
+                as_idx = i
+            elif as_idx is not None and re.match(r'^BEGIN\b', stripped):
+                begin_idx = i
+                break
+
+        if as_idx is None or begin_idx is None:
+            return tsql
+
+        # Collect DECLARE lines between AS and BEGIN
+        declare_section = []
+        other_between = []
+        for i in range(as_idx + 1, begin_idx):
+            line = lines[i]
+            stripped = line.strip().upper()
+            if stripped.startswith('DECLARE') or stripped == '':
+                declare_section.append(line)
+            else:
+                other_between.append(line)
+
+        if not declare_section:
+            return tsql
+
+        # Reconstruct: header up to AS, BEGIN, DECLARE lines, body
+        result_lines = lines[:as_idx + 1]  # up to and including AS
+        result_lines.extend(other_between)  # non-DECLARE lines between AS and BEGIN
+        result_lines.append(lines[begin_idx])  # BEGIN
+        result_lines.extend(declare_section)   # DECLARE moved inside BEGIN
+        result_lines.extend(lines[begin_idx + 1:])  # rest of body
+        return '\n'.join(result_lines)
 
 
 # ---------------------------------------------------------------------------
