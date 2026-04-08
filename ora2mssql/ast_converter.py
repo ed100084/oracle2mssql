@@ -99,6 +99,9 @@ def _transform_params(params_text: str) -> str:
     if not params_text.strip():
         return ""
 
+    # Strip inline -- comments before splitting (they can span parameter boundaries)
+    params_text = re.sub(r'--[^\n]*', '', params_text)
+
     result_params = []
     # Split on commas that are NOT inside parentheses
     parts = _split_params(params_text)
@@ -360,6 +363,24 @@ class AstConverter:
 
         logger.info(f"[AST] Found {len(routines)} routines in {pkg_name}")
 
+        # Fallback: if ANTLR4 parse errors caused too few routines to be found,
+        # switch to regex-based routine splitting + text-level transforms.
+        expected = len(re.findall(
+            r'^\s*(?:PROCEDURE|FUNCTION)\s+\w+', source,
+            re.IGNORECASE | re.MULTILINE
+        ))
+        if expected > 0 and len(routines) < max(1, expected * 0.8):
+            logger.warning(
+                f"[AST] ANTLR4 found only {len(routines)}/{expected} expected routines "
+                f"in {pkg_name} — switching to regex fallback splitter"
+            )
+            return self._convert_package_body_regex_fallback(
+                source=source,
+                pkg_name=pkg_name,
+                schema=schema,
+                output_dir=output_dir,
+            )
+
         # Step 4: Get all tokens as list
         token_stream.fill()
         all_tokens = token_stream.tokens  # list of Token objects
@@ -400,21 +421,157 @@ class AstConverter:
 
         return results
 
+    def _convert_package_body_regex_fallback(
+        self,
+        source: str,
+        pkg_name: str,
+        schema: str,
+        output_dir: Path,
+    ) -> list[ConversionResult]:
+        """Fallback: use regex-based routine splitter when ANTLR4 parse fails.
+
+        Splits the package body into individual routines using the regex engine's
+        _extract_subprograms logic, then applies the AST text-level transforms.
+        """
+        from .converter_rules.packages import PackageRule
+
+        class _MinimalCtx:
+            source_owner = "HRP"
+            source_name = pkg_name
+            source_type = "PACKAGE BODY"
+            target_schema = schema
+            warnings_list: list = []
+
+            def add_warning(self, msg: str) -> None:
+                self.warnings_list.append(msg)
+
+        rule = PackageRule()
+        ctx = _MinimalCtx()
+        procs = rule._extract_subprograms(source, ctx)
+        logger.info(f"[AST-Regex] Found {len(procs)} routines via regex in {pkg_name}")
+
+        results: list[ConversionResult] = []
+        all_routine_names = {name for name, _, _, _ in procs}
+
+        from .ast_visitors.syntax_transformer import SyntaxTransformer
+
+        for proc_name, proc_type, params_and_return, body in procs:
+            try:
+                is_function = proc_type.upper() == "FUNCTION"
+
+                # params_and_return is params_section from _extract_subprograms:
+                # procedures: "(p_a IN VARCHAR2, ...)\nAS"
+                # functions:  "(p_a IN VARCHAR2, ...) RETURNS NUMBER\nAS"
+                # Strip the trailing \nAS (or just AS) that _extract_subprograms appended
+                params_text = re.sub(r'\s*\bAS\s*$', '', params_and_return.strip(), flags=re.IGNORECASE)
+                return_type = None
+                # Extract RETURNS clause for functions
+                returns_m = re.search(r'\)\s*RETURNS\s+(\S+)\s*$', params_text, re.IGNORECASE)
+                if returns_m:
+                    return_type = returns_m.group(1)
+                    params_text = params_text[:returns_m.start() + 1]  # up to and including ')'
+                # Strip outer parens
+                params_text = re.sub(r'^\s*\(\s*', '', params_text)
+                params_text = re.sub(r'\s*\)\s*$', '', params_text)
+
+                # Convert Oracle params to T-SQL
+                params_tsql = _transform_params(params_text)
+                param_names = {p.strip().lstrip('@').split()[0] for p in params_tsql.split(',') if p.strip()}
+                # Fallback: extract param names from raw Oracle params
+                if not param_names:
+                    param_names = set(re.findall(r'^\s*(\w+)\s+(?:IN|OUT|INOUT)', params_text,
+                                                  re.IGNORECASE | re.MULTILINE))
+
+                # Build T-SQL header
+                header = _build_routine_header(
+                    schema=schema,
+                    name=proc_name,
+                    is_function=is_function,
+                    params_text=params_tsql,
+                    return_type=return_type,
+                )
+
+                # Create minimal SyntaxTransformer (tokens/stream not needed for text transforms)
+                transformer = SyntaxTransformer(
+                    tokens=None,
+                    stream=None,
+                    pkg_name=pkg_name,
+                    routine_name=proc_name,
+                    all_vars=set(),
+                    all_params=param_names,
+                )
+
+                # Apply text-level transformations to the routine body
+                body_tsql = self._transform_body_text(body, transformer, param_names)
+
+                # Combine and finalize
+                tsql = f"{header}\n{body_tsql}\nGO\n"
+                tsql = self._final_cleanup(tsql, schema, pkg_name, all_routine_names)
+
+                warnings: list[str] = []
+                manual_review: list[str] = []
+                if "TODO" in tsql:
+                    manual_review.append("Contains TODO items requiring manual review")
+
+                result = ConversionResult(
+                    source_name=f"{pkg_name}.{proc_name}",
+                    source_type=proc_type.upper(),
+                    target_schema=schema,
+                    target_name=proc_name,
+                    tsql=tsql,
+                    warnings=warnings,
+                    manual_review=manual_review,
+                    success=True,
+                )
+                results.append(result)
+
+                out_path = ensure_dir(output_dir / schema) / f"{pkg_name}__{proc_name}.sql"
+                write_file(out_path, tsql)
+                logger.info(f"[AST-Regex] Converted {schema}.{proc_name} → {out_path}")
+
+            except Exception as e:
+                logger.error(f"[AST-Regex] Failed to convert {proc_name}: {e}", exc_info=True)
+                results.append(ConversionResult(
+                    source_name=f"{pkg_name}.{proc_name}",
+                    source_type=proc_type.upper(),
+                    target_schema=schema,
+                    target_name=proc_name,
+                    tsql=f"-- CONVERSION FAILED: {e}\n",
+                    warnings=[str(e)],
+                    success=False,
+                ))
+
+        return results
+
     def _wrap_source(self, source: str, pkg_name: str) -> str:
-        """Add CREATE OR REPLACE PACKAGE BODY wrapper if needed."""
+        """Add CREATE OR REPLACE PACKAGE BODY wrapper if needed.
+
+        Input files may contain both the package SPEC and BODY (exported together
+        from Oracle).  When both are present, we extract only the BODY section so
+        the ANTLR4 parser does not choke on the spec syntax.
+        """
         s = source.strip()
-        # Already has CREATE OR REPLACE
-        if re.match(r'CREATE\s+(OR\s+REPLACE\s+)?PACKAGE\s+BODY', s, re.IGNORECASE):
+
+        # If the file contains a PACKAGE BODY section (possibly after a spec),
+        # extract from that point onward.
+        body_start = re.search(
+            r'CREATE\s+OR\s+REPLACE\s+PACKAGE\s+BODY\b',
+            s, re.IGNORECASE
+        )
+        if body_start:
+            s = s[body_start.start():]
             if not s.endswith('/'):
                 s += '\n/'
             return s
-        # Starts with PACKAGE BODY
+
+        # Starts with PACKAGE BODY (no CREATE OR REPLACE prefix)
         if re.match(r'PACKAGE\s+BODY', s, re.IGNORECASE):
             s = f"CREATE OR REPLACE {s}"
             if not s.endswith('/'):
                 s += '\n/'
             return s
-        # Bare body (starts with PROCEDURE or comment)
+
+        # Bare body (starts with PROCEDURE/FUNCTION/comments)
         return f"CREATE OR REPLACE PACKAGE BODY {pkg_name} IS\n{s}\nEND {pkg_name};\n/"
 
     def _convert_routine(
@@ -527,6 +684,11 @@ class AstConverter:
         # 3b. Apply @ prefix to cursor queries (they reference local vars)
         decls = self._prefix_cursor_queries(decls, all_var_names)
 
+        # 3c. Apply built-in function transforms to declare default values
+        for d in decls:
+            if d.get('default') and not d.get('is_cursor'):
+                d['default'] = transformer._convert_functions(d['default'])
+
         # 4. Apply @ prefix to default values in DECLARE
         decls = self._prefix_declare_defaults(decls, all_var_names | param_names)
 
@@ -631,7 +793,7 @@ class AstConverter:
         # Pattern: BEGIN <body> EXCEPTION <when_clauses> END
         # Handle with a loop to support multiple exception blocks
         result = body
-        max_iterations = 20
+        max_iterations = 200
         iteration = 0
 
         while iteration < max_iterations:
@@ -644,6 +806,13 @@ class AstConverter:
             exc_pos = exc_m.start()
             before_exc = result[:exc_pos]
             after_exc = result[exc_pos + len('EXCEPTION'):]
+
+            # Skip EXCEPTION tokens that are inside /* ... */ block comments
+            open_comments = before_exc.count('/*') - before_exc.count('*/')
+            if open_comments > 0:
+                # This EXCEPTION is inside a block comment — replace with a placeholder and continue
+                result = result[:exc_pos] + '__EXCEPTION_IN_COMMENT__' + result[exc_pos + len('EXCEPTION'):]
+                continue
 
             # Find the matching BEGIN for this EXCEPTION block
             # Walk backwards through before_exc counting BEGIN/END depth
@@ -685,6 +854,8 @@ class AstConverter:
                           self._parse_when_clauses(after_exc) + "\nEND CATCH")
                 break
 
+        # Restore any EXCEPTION tokens that were inside block comments
+        result = result.replace('__EXCEPTION_IN_COMMENT__', 'EXCEPTION')
         return result
 
     def _find_matching_begin_pos(self, text: str) -> Optional[int]:
@@ -799,24 +970,33 @@ class AstConverter:
         return '\n'.join(result_parts)
 
     def _split_declare_body(self, source: str) -> tuple[str, str]:
-        """Split Oracle routine source into (declare_section, begin_to_end)."""
-        # Remove the procedure/function signature first
-        # Find the first standalone BEGIN (not in a comment or string)
+        """Split Oracle routine source into (declare_section, begin_to_end).
+
+        If source starts with a PROCEDURE/FUNCTION header, the header IS/AS line
+        is skipped so only the declare variables are in declare_section.
+        If source starts directly with declarations (fallback path after header
+        has already been stripped), header_end stays 0.
+        """
         lines = source.split('\n')
         begin_line = None
-        in_header = True  # skip until we're past IS/AS
 
-        # Find IS/AS (end of header)
+        # Find IS/AS (end of header) — only valid if PROCEDURE/FUNCTION seen first.
+        # This prevents the cursor's "CURSOR x (...) IS" from being mistaken for
+        # the routine header separator.
         header_end = 0
+        seen_proc_keyword = False
         for i, line in enumerate(lines):
             stripped = re.sub(r'--.*$', '', line).strip().upper()
-            if re.match(r'^(IS|AS)\s*$', stripped) or re.search(r'\bAS\s*$', stripped) or re.search(r'\bIS\s*$', stripped):
-                header_end = i + 1
-                break
+            if re.search(r'\b(PROCEDURE|FUNCTION)\b', stripped):
+                seen_proc_keyword = True
+            if seen_proc_keyword:
+                if re.match(r'^(IS|AS)\s*$', stripped) or re.search(r'\b(IS|AS)\s*$', stripped):
+                    header_end = i + 1
+                    break
             if i > 50:  # give up looking for IS/AS
                 break
 
-        # Now find BEGIN in the declare section
+        # Now find BEGIN in the declare section (or from the top if no header)
         for i in range(header_end, len(lines)):
             stripped = re.sub(r'--.*$', '', lines[i]).strip().upper()
             if re.match(r'^BEGIN\b', stripped):
@@ -842,7 +1022,7 @@ class AstConverter:
         # Match variable declarations: name type [:= default] ;
         # Also handle CURSOR ... IS SELECT...
         cursor_pattern = re.compile(
-            r'CURSOR\s+(\w+)\s+IS\s+(SELECT[^;]+);',
+            r'CURSOR\s+(\w+)\s*(?:\([^)]*\))?\s+IS\s+((?:WITH\b|SELECT\b)[^;]+);',
             re.IGNORECASE | re.DOTALL
         )
         for m in cursor_pattern.finditer(text):
@@ -872,10 +1052,11 @@ class AstConverter:
         # Type can include parentheses: VARCHAR2(100), NUMBER(10,2)
         var_pattern = re.compile(
             r'(\w+)\s+'
+            r'(?:CONSTANT\s+)?'  # optional CONSTANT keyword
             r'((?:N?VARCHAR2|NCHAR|CHAR|NUMBER|DECIMAL|INTEGER|INT|SMALLINT|BIGINT|'
             r'FLOAT|REAL|DATE|TIMESTAMP|BOOLEAN|PLS_INTEGER|BINARY_INTEGER|'
             r'BINARY_FLOAT|BINARY_DOUBLE|CLOB|BLOB|NCLOB|XMLTYPE|'
-            r'SYS_REFCURSOR|\w+\s*(?:%TYPE|%ROWTYPE)?)\s*(?:\([^)]*\))?)'
+            r'SYS_REFCURSOR|\w+(?:\.\w+)?\s*(?:%TYPE|%ROWTYPE)?)\s*(?:\([^)]*\))?)'
             r'(?:\s*:=\s*([^;]+?))?'
             r'\s*;',
             re.IGNORECASE
@@ -967,40 +1148,152 @@ class AstConverter:
             body = re.sub(pattern, f'@{var}', body, flags=re.IGNORECASE)
         return body
 
+    def _case_depth_update(self, depth: int, line: str) -> int:
+        """Update CASE expression depth counter based on tokens on a line.
+
+        CASE → +1, bare END (not END IF/LOOP/TRY/CATCH/CASE) → -1 (min 0).
+        Used to avoid converting THEN/ELSE inside multi-line CASE expressions.
+        """
+        for m in re.finditer(
+            r'\b(END\s+IF|END\s+LOOP|END\s+TRY|END\s+CATCH|END\s+CASE|CASE|END)\b',
+            line, re.IGNORECASE
+        ):
+            kw = ' '.join(m.group(1).upper().split())
+            if kw == 'CASE':
+                depth += 1
+            elif kw == 'END':
+                depth = max(0, depth - 1)
+            elif kw == 'END CASE':
+                depth = max(0, depth - 1)
+            # END IF, END LOOP, END TRY, END CATCH: don't change CASE depth
+        return depth
+
     def _fix_if_structure(self, source: str) -> str:
-        """Fix Oracle IF/THEN/ELSIF/END IF → T-SQL IF/BEGIN/END."""
-        result = source
-        # IF ... THEN → IF ... BEGIN
-        # Only replace THEN at end of line (with optional comment) — preserves CASE WHEN ... THEN value
+        """Fix Oracle IF/THEN/ELSIF/END IF → T-SQL IF/BEGIN/END.
+
+        Processes line-by-line so that commented-out Oracle code (--) is not transformed.
+        Tracks CASE expression depth to avoid converting THEN/ELSE inside CASE WHEN...THEN.
+        """
+        lines_in = source.split('\n')
+        lines_out = []
+        case_depth = 0  # tracks depth inside SQL CASE expressions (cross-line)
+        skip_end_if = False  # True after inline-ELSE handler; next END IF is already accounted for
+
+        for line in lines_in:
+            stripped = line.lstrip()
+            is_comment = stripped.startswith('--')
+
+            if is_comment:
+                lines_out.append(line)
+                continue
+
+            # ELSIF → END\nELSE IF  (non-comment lines only)
+            if re.search(r'\bELSIF\b', line, re.IGNORECASE):
+                line = re.sub(r'\bELSIF\b', 'END\nELSE IF', line, flags=re.IGNORECASE)
+                # After substitution line may contain \n; apply END IF + THEN→BEGIN
+                # to each resulting sub-line individually, then emit and skip rest.
+                sub_lines = line.split('\n')
+                processed_subs = []
+                for sl in sub_lines:
+                    sl = re.sub(r'\bEND\s+IF\b[ \t]*;?', 'END', sl, flags=re.IGNORECASE)
+                    if case_depth == 0 and re.search(r'\bTHEN\b', sl, re.IGNORECASE):
+                        sl = re.sub(
+                            r'^((?:(?!\bWHEN\b).)*)\bTHEN\b',
+                            r'\1BEGIN',
+                            sl, flags=re.IGNORECASE
+                        )
+                    case_depth = self._case_depth_update(case_depth, sl)
+                    processed_subs.append(sl)
+                lines_out.extend(processed_subs)
+                continue
+
+            # END IF → END  (skip if after inline-ELSE, which already generated END)
+            if skip_end_if and re.search(r'\bEND\s+IF\b', line, re.IGNORECASE):
+                line = re.sub(r'\bEND\s+IF\b[ \t]*;?', '', line, flags=re.IGNORECASE).strip()
+                skip_end_if = False
+                if not line:
+                    continue  # drop the now-empty line
+            else:
+                line = re.sub(r'\bEND\s+IF\b[ \t]*;?', 'END', line, flags=re.IGNORECASE)
+                if skip_end_if:
+                    skip_end_if = False
+
+            # IF ... THEN (anywhere on line, no WHEN in prefix, not inside CASE) → IF ... BEGIN
+            # Handles both end-of-line THEN and single-line "IF cond THEN stmt END IF"
+            if case_depth == 0 and re.search(r'\bTHEN\b', line, re.IGNORECASE):
+                line = re.sub(
+                    r'^((?:(?!\bWHEN\b).)*)\bTHEN\b',
+                    r'\1BEGIN',
+                    line, flags=re.IGNORECASE
+                )
+
+            # ELSE (not ELSE IF, not inside CASE expression) at end of line → END\nELSE\nBEGIN
+            if case_depth == 0:
+                m_else = re.match(r'^(\s*)ELSE\b(?!\s*IF\b)([ \t]*(?:--[^\n]*)?)$', line, re.IGNORECASE)
+                if m_else:
+                    indent = m_else.group(1)
+                    comment = m_else.group(2)
+                    # Update case_depth before emitting (ELSE line has no CASE/END tokens)
+                    lines_out.append(f"{indent}END")
+                    lines_out.append(f"{indent}ELSE")
+                    lines_out.append(f"{indent}BEGIN{comment}")
+                    continue
+
+                # Inline ELSE: Oracle "ELSE stmt;" on one line (not ELSE IF, not comment-only)
+                # e.g. "else i_end_date := p_end_date;" → "END\nELSE\nBEGIN\n  stmt\nEND"
+                # After this, the following END IF is already accounted for (skip_end_if=True).
+                m_inline_else = re.match(r'^(\s*)ELSE\b(?!\s*IF\b)\s+(\S.+)$', line, re.IGNORECASE)
+                if m_inline_else:
+                    indent = m_inline_else.group(1)
+                    stmt = m_inline_else.group(2)
+                    case_depth = self._case_depth_update(case_depth, stmt)
+                    lines_out.append(f"{indent}END")
+                    lines_out.append(f"{indent}ELSE")
+                    lines_out.append(f"{indent}BEGIN")
+                    lines_out.append(f"{indent}    {stmt}")
+                    lines_out.append(f"{indent}END")
+                    skip_end_if = True  # next END IF is already handled by the END above
+                    continue
+
+            # Update case_depth after THEN/ELSE decisions for this line
+            case_depth = self._case_depth_update(case_depth, line)
+            lines_out.append(line)
+
+        result = '\n'.join(lines_out)
+
+        # Fix Oracle BOOLEAN variable used directly as IF condition → T-SQL error 4145.
+        # IF (@var) BEGIN or IF @var BEGIN (no comparison operator) → IF @var <> 0 BEGIN
         result = re.sub(
-            r'\bTHEN\b([ \t]*(?:--[^\n]*)?)$',
-            r'BEGIN\1',
-            result, flags=re.IGNORECASE | re.MULTILINE
-        )
-        # ELSIF → END\nELSE IF
-        result = re.sub(
-            r'\bELSIF\b',
-            'END\nELSE IF',
+            r'\bIF\s+\((@\w+)\)\s+BEGIN\b',
+            r'IF \1 <> 0 BEGIN',
             result, flags=re.IGNORECASE
         )
-        # ELSE (not ELSE IF) at end of a line → END\nELSE\nBEGIN
-        # This closes the previous BEGIN block and opens a new one for ELSE body.
         result = re.sub(
-            r'^(\s*)ELSE\b(?!\s*IF\b)([ \t]*(?:--[^\n]*)?)$',
-            r'\1END\n\1ELSE\n\1BEGIN\2',
-            result, flags=re.IGNORECASE | re.MULTILINE
-        )
-        # END IF → END
-        result = re.sub(
-            r'\bEND\s+IF\b[ \t]*;?',
-            'END',
+            r'\bIF\s+(?!\()(@\w+)\s+BEGIN\b',
+            r'IF \1 <> 0 BEGIN',
             result, flags=re.IGNORECASE
         )
         return result
 
     def _fix_loop_structure(self, source: str) -> str:
-        """Fix Oracle LOOP/FOR LOOP/WHILE LOOP → T-SQL WHILE/BEGIN/END."""
-        result = source
+        """Fix Oracle LOOP/FOR LOOP/WHILE LOOP → T-SQL WHILE/BEGIN/END.
+
+        Temporarily replaces comment lines with placeholders so that LOOP/EXIT
+        patterns inside comments are not transformed.
+        """
+        # Protect comment lines: replace with indexed placeholders
+        _COMMENT_HOLDER = '\x00COMMENT_{}\x00'
+        saved_comments: list[str] = []
+        lines = source.split('\n')
+        protected = []
+        for line in lines:
+            if line.lstrip().startswith('--'):
+                idx = len(saved_comments)
+                saved_comments.append(line)
+                protected.append(_COMMENT_HOLDER.format(idx))
+            else:
+                protected.append(line)
+        result = '\n'.join(protected)
 
         # FOR i IN lower..upper LOOP → DECLARE @i INT; SET @i = lower; WHILE @i <= upper BEGIN
         def for_numeric_loop(m):
@@ -1076,6 +1369,10 @@ class AstConverter:
         # Plain EXIT → BREAK
         result = re.sub(r'\bEXIT\b\s*;', 'BREAK;', result, flags=re.IGNORECASE)
 
+        # Restore protected comment lines
+        for idx, comment_line in enumerate(saved_comments):
+            result = result.replace(_COMMENT_HOLDER.format(idx), comment_line)
+
         return result
 
     def _final_cleanup(self, tsql: str, schema: str, pkg_name: str,
@@ -1085,6 +1382,14 @@ class AstConverter:
         tsql = re.sub(
             r'\bEND\s+' + re.escape(pkg_name) + r'\s*;',
             'END',
+            tsql, flags=re.IGNORECASE
+        )
+
+        # Remove empty parameter list () from no-parameter procedure declarations.
+        # T-SQL: "CREATE OR ALTER PROCEDURE [s].[p]" (no parens); Oracle emits empty ().
+        tsql = re.sub(
+            r'(?m)(CREATE\s+OR\s+ALTER\s+PROCEDURE\s+\[\w+\]\.\[\w+\])\s*\n\s*\(\s*\)',
+            r'\1',
             tsql, flags=re.IGNORECASE
         )
 
@@ -1121,6 +1426,43 @@ class AstConverter:
             tsql, flags=re.IGNORECASE
         )
 
+        # Cross-package calls: OTHER_PKG_NAME.routine → [other_schema].[routine]
+        # Handles EHRPHRAFUNC_PKG.func(...) called from EHRPHRA12_PKG, etc.
+        # Uses the OTHER package's schema name (lowercase pkg name), not the current schema.
+        _KNOWN_PKGS = ['EHRPHRA3_PKG', 'EHRPHRA12_PKG', 'EHRPHRAFUNC_PKG']
+        for _other_pkg in _KNOWN_PKGS:
+            if _other_pkg.lower() != pkg_name.lower():
+                _other_schema = _other_pkg.lower()
+                tsql = re.sub(
+                    re.escape(_other_pkg) + r'\.(\w+)',
+                    lambda m, s=_other_schema: f"[{s}].[{m.group(1)}]",
+                    tsql, flags=re.IGNORECASE
+                )
+
+        # hrpuser.PACKAGE.proc(args) → EXEC proc args  (three-part Oracle call → T-SQL EXEC)
+        # Matches the full arg list (one level of nested parens) to produce EXEC without outer parens.
+        tsql = re.sub(
+            r'\bhrpuser\.(\w+)\.(\w+)\s*\(((?:[^)(]|\([^)]*\))*)\)',
+            lambda m: f"/* TODO: hrpuser.{m.group(1)}.{m.group(2)}(...) */ EXEC {m.group(2)} {m.group(3)}",
+            tsql, flags=re.IGNORECASE
+        )
+        # hrpuser.proc(args) two-part form
+        tsql = re.sub(
+            r'\bhrpuser\.(\w+)\s*\(((?:[^)(]|\([^)]*\))*)\)',
+            lambda m: f"/* TODO: hrpuser.{m.group(1)}(...) */ EXEC {m.group(1)} {m.group(2)}",
+            tsql, flags=re.IGNORECASE
+        )
+
+        # Convert standalone [schema].[proc](args); without EXEC to EXEC [schema].[proc] args;
+        # Handles both single-line and multi-line calls (with one level of nested parens in args).
+        # Only matches when the proc call is at the START of a statement (beginning of line).
+        # This avoids false positives for function calls in SELECT/SET context.
+        tsql = re.sub(
+            r'(?m)^(\s*)(\[\w+\]\.\[\w+\])\s*\(((?:[^)(]|\([^)]*\))*)\)\s*;',
+            r'\1EXEC \2 \3;',
+            tsql, flags=re.IGNORECASE | re.DOTALL
+        )
+
         # Fix T-SQL function DECLARE inside functions (functions need DECLARE inside BEGIN)
         tsql = self._fix_function_declare_placement(tsql)
 
@@ -1137,12 +1479,132 @@ class AstConverter:
         # T-SQL requires aliases; Oracle does not. Pattern: FROM (subquery) ; or FROM (subquery)\n
         tsql = self._add_derived_table_aliases(tsql)
 
-        # Convert Oracle NULL statement (standalone NULL; → comment)
-        tsql = re.sub(r'(?m)^\s*NULL\s*;\s*$', '-- NULL (no-op)', tsql, flags=re.IGNORECASE)
+        # Convert Oracle NULL statement (standalone NULL; → T-SQL null/empty statement)
+        # Use semicolon rather than a comment so that T-SQL's parser sees a real statement.
+        # A comment-only BEGIN/END block followed by ELSE causes "near ELSE" parse errors.
+        tsql = re.sub(r'(?m)^(\s*)NULL\s*;\s*$', r'\1;  -- null statement', tsql, flags=re.IGNORECASE)
+
+        # Eliminate null-body IF branches: "IF cond BEGIN ; END ELSE BEGIN content END"
+        # → "IF NOT (cond) BEGIN content END"
+        # When the IF branch is only a null statement, negate the condition and use the ELSE content.
+        tsql = re.sub(
+            r'(?m)^(\s*)IF\b([^\n]+?)BEGIN\s*\n\s*;\s*--\s*null statement[^\n]*\n\s*END\s*\n\s*ELSE\s*\n\s*BEGIN\b',
+            lambda m: f'{m.group(1)}IF NOT ({m.group(2).strip()}) BEGIN',
+            tsql, flags=re.IGNORECASE
+        )
+
+        # Strip Oracle outer-join indicator (+) — T-SQL uses explicit LEFT JOIN syntax.
+        # Removing (+) converts the join to an implicit inner join (semantics may differ).
+        tsql = re.sub(r'\s*\(\+\)', '', tsql)
+
+        # Remove incorrectly @ -prefixed numeric literals (e.g. @10 → 10).
+        # Variable names in Oracle/T-SQL must start with a letter or _, never a digit.
+        tsql = re.sub(r'@(\d+)\b', r'\1', tsql)
+
+        # Quote T-SQL reserved word MERGE when used as a column name.
+        # Column MERGE: preceded by whitespace/operator, NOT followed by INTO/USING (DML).
+        tsql = re.sub(
+            r'(?<=[=(,\s])\bMERGE\b(?!\s+(?:INTO|USING)\b)',
+            '[MERGE]', tsql, flags=re.IGNORECASE
+        )
+
+        # Parameterized cursor OPEN: OPEN cursor_name(args) → OPEN cursor_name
+        # T-SQL cursors don't support parameterized OPEN calls.
+        tsql = re.sub(r'\bOPEN\s+(\w+)\s*\([^)]*\)\s*;', r'OPEN \1;', tsql, flags=re.IGNORECASE)
 
         # Convert SQLCODE / SQLERRM
         tsql = re.sub(r'\bSQLCODE\b', 'ERROR_NUMBER()', tsql, flags=re.IGNORECASE)
         tsql = re.sub(r'\bSQLERRM\b', 'ERROR_MESSAGE()', tsql, flags=re.IGNORECASE)
+
+        # Fix string concatenation with ERROR_NUMBER() / ERROR_MESSAGE() — T-SQL requires CAST.
+        # Pattern: 'string' + ERROR_NUMBER() or ERROR_NUMBER() + 'string'
+        # Only wrap in CAST when adjacent to + (string concat context).
+        tsql = re.sub(
+            r"(\+\s*)ERROR_NUMBER\(\)",
+            r"\1CAST(ERROR_NUMBER() AS NVARCHAR)",
+            tsql, flags=re.IGNORECASE
+        )
+        tsql = re.sub(
+            r"ERROR_NUMBER\(\)(\s*\+)",
+            r"CAST(ERROR_NUMBER() AS NVARCHAR)\1",
+            tsql, flags=re.IGNORECASE
+        )
+        tsql = re.sub(
+            r"(\+\s*)ERROR_MESSAGE\(\)",
+            r"\1CAST(ERROR_MESSAGE() AS NVARCHAR)",
+            tsql, flags=re.IGNORECASE
+        )
+        tsql = re.sub(
+            r"ERROR_MESSAGE\(\)(\s*\+)",
+            r"CAST(ERROR_MESSAGE() AS NVARCHAR)\1",
+            tsql, flags=re.IGNORECASE
+        )
+
+        # Oracle CHR(n) → T-SQL CHAR(n)
+        tsql = re.sub(r'\bCHR\s*\(', 'CHAR(', tsql, flags=re.IGNORECASE)
+
+        # Oracle MOD(x, y) → T-SQL (x % y)
+        # Simple two-arg form; handles non-nested args.
+        def _convert_mod(m):
+            return f'({m.group(1).strip()} % {m.group(2).strip()})'
+        tsql = re.sub(
+            r'\bMOD\s*\(([^,()]+),\s*([^()]+)\)',
+            _convert_mod,
+            tsql, flags=re.IGNORECASE
+        )
+
+        # Oracle ROUND(x) single-arg → T-SQL ROUND(x, 0) (T-SQL requires scale arg).
+        # Avoid matching ROUND(x, y) which already has two args.
+        tsql = re.sub(
+            r'\bROUND\s*\(([^,()]+)\)',
+            r'ROUND(\1, 0)',
+            tsql, flags=re.IGNORECASE
+        )
+
+        # Oracle TO_NUMBER(val, 'mask') was converted to CAST(val, mask AS type).
+        # Remove the format mask — T-SQL CAST doesn't support it.
+        # Pattern: CAST(expr, digits AS type) → CAST(expr AS type)
+        tsql = re.sub(
+            r'\bCAST\s*\(([^,\n]+),\s*\d+\s+AS\s+(\w+(?:\(\d+(?:,\s*\d+)?\))?)\)',
+            r'CAST(\1 AS \2)',
+            tsql, flags=re.IGNORECASE
+        )
+
+        # Comment out Oracle UTL_SMTP procedure calls (no T-SQL equivalent).
+        # Replace entire statement line(s) with a TODO comment.
+        tsql = re.sub(
+            r'(?m)^([ \t]*)(\w+\.(?:open_connection|helo|mail|rcpt|open_data|write_raw_data|close_data|quit)\s*\([^;]*\))\s*;',
+            r'\1-- TODO(utl_smtp): \2;',
+            tsql, flags=re.IGNORECASE
+        )
+        # Also handle SET var = utl_smtp.*
+        tsql = re.sub(
+            r'(?m)^([ \t]*)(SET\s+@\w+\s*=\s*\w+\.(?:open_connection|connection)\s*\([^;]*\))\s*;',
+            r'\1-- TODO(utl_smtp): \2;',
+            tsql, flags=re.IGNORECASE
+        )
+        # Handle DECLARE @var utl_smtp.connection → DECLARE @var NVARCHAR(MAX)
+        tsql = re.sub(
+            r'\butl_smtp\.connection\b',
+            'NVARCHAR(MAX)',
+            tsql, flags=re.IGNORECASE
+        )
+
+        # Fix EXEC calls where an arg contains a string concatenation expression
+        # (T-SQL EXEC positional args don't allow expressions — must use a variable).
+        # Pattern: EXEC [schema].[proc] ...,\n     'string'+CAST(ERROR_NUMBER() AS NVARCHAR);
+        # Fix: extract expression to DECLARE @__exec_arg; SET @__exec_arg = expr; then EXEC uses @__exec_arg
+        tsql = re.sub(
+            r'(?m)^([ \t]*)(EXEC\s+\S+(?:[ \t]+[^\n]+,)?)\s*\n'
+            r'([ \t]*)([^\n;]*\+CAST\(ERROR_(?:NUMBER|MESSAGE)\(\)[^\n;]*);',
+            lambda m: (
+                f"{m.group(1)}DECLARE @__exec_arg NVARCHAR(MAX);\n"
+                f"{m.group(1)}SET @__exec_arg = {m.group(4).strip()};\n"
+                f"{m.group(1)}{m.group(2)}\n"
+                f"{m.group(3)}@__exec_arg;"
+            ),
+            tsql, flags=re.IGNORECASE
+        )
 
         # Convert Oracle block labels <<label>> → label: (T-SQL GOTO label)
         tsql = re.sub(r'<<(\w+)>>', r'\1:', tsql)
@@ -1153,6 +1615,36 @@ class AstConverter:
             lambda m: f"RAISERROR({m.group(2)}, 16, 1)",
             tsql, flags=re.IGNORECASE
         )
+
+        # Convert Oracle ROWNUM references
+        # Remove rownum from window function ORDER BY clauses (not valid in T-SQL)
+        tsql = re.sub(
+            r'(ORDER\s+BY\s+\w+(?:\s+(?:ASC|DESC))?)\s*,\s*ROWNUM\b',
+            r'\1',
+            tsql, flags=re.IGNORECASE
+        )
+        # WHERE ROWNUM = 1 → 1=1 /* TODO: use TOP 1 */
+        tsql = re.sub(
+            r'\bROWNUM\s*=\s*1\b',
+            '1=1 /* TODO: converted ROWNUM=1 → use TOP 1 */',
+            tsql, flags=re.IGNORECASE
+        )
+        # AND/WHERE ROWNUM <= N → comment (regex engine approach)
+        tsql = re.sub(
+            r'\bAND\s+ROWNUM\s*<=\s*(\d+)',
+            r'/* TODO: ROWNUM<=\1 converted */',
+            tsql, flags=re.IGNORECASE
+        )
+        tsql = re.sub(
+            r'\bWHERE\s+ROWNUM\s*<=\s*(\d+)',
+            r'/* TODO: ROWNUM<=\1 converted */',
+            tsql, flags=re.IGNORECASE
+        )
+
+        # Deduplicate inline DECLARE statements in procedure body.
+        # Multiple cursor FOR loops may each emit "DECLARE @__dummy INT" (or similar),
+        # causing T-SQL error 134 (variable already declared in the same batch).
+        tsql = self._deduplicate_inline_declares(tsql)
 
         # Deduplicate T-SQL labels: if a label name appears more than once,
         # suffix each occurrence (and its matching GOTO) with _1, _2, ...
@@ -1264,6 +1756,27 @@ class AstConverter:
 
         return tsql
 
+    def _deduplicate_inline_declares(self, tsql: str) -> str:
+        """Remove duplicate inline DECLARE statements in a routine body.
+
+        Multiple cursor FOR loops may emit identical DECLARE lines (e.g. DECLARE @__dummy INT),
+        causing T-SQL error 134 (variable name already declared in the same batch).
+        Keeps the first occurrence; subsequent identical DECLARE lines are commented out.
+        """
+        declare_re = re.compile(r'^\s*DECLARE\s+(@\w+)\b', re.IGNORECASE)
+        seen: set[str] = set()
+        out_lines = []
+        for line in tsql.split('\n'):
+            m = declare_re.match(line)
+            if m:
+                vname = m.group(1).lower()
+                if vname in seen:
+                    out_lines.append('-- ' + line.lstrip() + '  -- deduplicated')
+                    continue
+                seen.add(vname)
+            out_lines.append(line)
+        return '\n'.join(out_lines)
+
     def _convert_cursor_syntax(self, tsql: str) -> str:
         """Convert Oracle cursor syntax to T-SQL."""
         # %NOTFOUND → @@FETCH_STATUS <> 0
@@ -1352,10 +1865,16 @@ class AstConverter:
                     j += 1
 
                 block = '\n'.join(block_lines)
+                # Strip comment lines and inline comments before regex matching so that
+                # commented-out columns/variables don't confuse the column count.
+                block_no_comments = '\n'.join(
+                    '' if l.strip().startswith('--') else re.sub(r'\s*--[^\n]*', '', l)
+                    for l in block_lines
+                )
                 # Try single-line pattern on the accumulated block
                 m = re.match(
                     r'(\s*SELECT\s+)([\s\S]+?)\s+INTO\s+((?:@?\w+\s*(?:,\s*@?\w+\s*)*)?)\s+FROM\b([\s\S]*)',
-                    block, re.IGNORECASE
+                    block_no_comments, re.IGNORECASE
                 )
                 if m and found_into and found_from:
                     select_list = m.group(2).strip()
@@ -1363,12 +1882,14 @@ class AstConverter:
                     from_rest = 'FROM' + m.group(4)
                     sel_cols = [c.strip() for c in _split_params(select_list)]
                     into_v = [v.strip() for v in _split_params(into_vars)]
-                    # Strip column aliases (trailing bare word not preceded by operator)
-                    _alias_re = re.compile(r'^(.*\))\s+\w+$', re.DOTALL)
+                    # Strip column aliases: "expr AS alias" (with/without space) or bare "expr alias"
                     def strip_alias(col):
                         col = col.strip()
-                        am = _alias_re.match(col)
-                        return am.group(1).strip() if am else col
+                        # Remove trailing "AS alias" (handles no-space case like "))AS alias")
+                        col = re.sub(r'\s*\bAS\s+\w+\s*$', '', col, flags=re.IGNORECASE).strip()
+                        # Remove bare alias after closing paren: "func(...) alias"
+                        col = re.sub(r'(\))\s+\w+\s*$', r'\1', col).strip()
+                        return col
                     sel_cols = [strip_alias(c) for c in sel_cols]
                     if len(sel_cols) == len(into_v) and into_v:
                         assignments = ', '.join(

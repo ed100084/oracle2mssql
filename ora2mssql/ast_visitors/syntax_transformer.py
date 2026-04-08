@@ -103,7 +103,11 @@ def _extract_func_args(s: str, start: int) -> tuple[str, int]:
 
 
 def _convert_func_calls(s: str, func_name: str, converter) -> str:
-    """Replace all occurrences of func_name(...) using a paren-aware extractor."""
+    """Replace all occurrences of func_name(...) using a paren-aware extractor.
+
+    Processes innermost occurrences first (recursive), so nested calls like
+    TO_DATE(TO_DATE(...)) are correctly handled inside-out.
+    """
     result = []
     i = 0
     pat = re.compile(r'\b' + re.escape(func_name) + r'\s*\(', re.IGNORECASE)
@@ -114,6 +118,8 @@ def _convert_func_calls(s: str, func_name: str, converter) -> str:
             break
         result.append(s[i:m.start()])
         inner, end = _extract_func_args(s, m.end())
+        # Recursively convert nested same-function calls inside the args first
+        inner = _convert_func_calls(inner, func_name, converter)
         result.append(converter(inner))
         i = end
     return ''.join(result)
@@ -549,10 +555,12 @@ class SyntaxTransformer:
         s = _convert_func_calls(s, 'TO_DATE', _to_date_convert)
         s = _convert_func_calls(s, 'TO_NUMBER', _to_number_convert)
 
-        # TRUNC(date) → CAST(date AS DATE)
-        s = re.sub(r'\bTRUNC\s*\(([^,)]+)\)',
-                   lambda m: f"CAST({m.group(1).strip()} AS DATE)",
-                   s, flags=re.IGNORECASE)
+        # TRUNC(date[, fmt]) → CAST(date AS DATE)  (paren-aware to handle nested calls)
+        def _trunc_convert(inner: str) -> str:
+            args = _split_args(inner)
+            expr = args[0].strip() if args else inner.strip()
+            return f"CAST({expr} AS DATE)"
+        s = _convert_func_calls(s, 'TRUNC', _trunc_convert)
 
         # CEIL(x) → CEILING(x)
         s = re.sub(r'\bCEIL\s*\(', 'CEILING(', s, flags=re.IGNORECASE)
@@ -560,29 +568,29 @@ class SyntaxTransformer:
         # LAST_DAY(date) → EOMONTH(date)
         s = re.sub(r'\bLAST_DAY\s*\(', 'EOMONTH(', s, flags=re.IGNORECASE)
 
-        # MONTHS_BETWEEN(d1, d2) → DATEDIFF(MONTH, d2, d1)
-        def months_between(m):
-            args = m.group(1).split(',', 1)
+        # MONTHS_BETWEEN(d1, d2) → DATEDIFF(MONTH, d2, d1)  (paren-aware)
+        def _months_between_convert(inner: str) -> str:
+            args = _split_args(inner)
             if len(args) == 2:
                 return f"DATEDIFF(MONTH, {args[1].strip()}, {args[0].strip()})"
-            return f"/*MONTHS_BETWEEN*/ {m.group(0)}"
-        s = re.sub(r'\bMONTHS_BETWEEN\s*\(([^)]+)\)', months_between, s, flags=re.IGNORECASE)
+            return f"/*MONTHS_BETWEEN*/ MONTHS_BETWEEN({inner})"
+        s = _convert_func_calls(s, 'MONTHS_BETWEEN', _months_between_convert)
 
-        # ADD_MONTHS(date, n) → DATEADD(MONTH, n, date)
-        def add_months(m):
-            args = m.group(1).split(',', 1)
+        # ADD_MONTHS(date, n) → DATEADD(MONTH, n, date)  (paren-aware for nested calls)
+        def _add_months_convert(inner: str) -> str:
+            args = _split_args(inner)
             if len(args) == 2:
                 return f"DATEADD(MONTH, {args[1].strip()}, {args[0].strip()})"
-            return m.group(0)
-        s = re.sub(r'\bADD_MONTHS\s*\(([^)]+)\)', add_months, s, flags=re.IGNORECASE)
+            return f"ADD_MONTHS({inner})"
+        s = _convert_func_calls(s, 'ADD_MONTHS', _add_months_convert)
 
-        # INSTR(str, sub) → CHARINDEX(sub, str)
-        def instr_replace(m):
-            args = m.group(1).split(',', 1)
-            if len(args) == 2:
+        # INSTR(str, sub) → CHARINDEX(sub, str)  (paren-aware)
+        def _instr_convert(inner: str) -> str:
+            args = _split_args(inner)
+            if len(args) >= 2:
                 return f"CHARINDEX({args[1].strip()}, {args[0].strip()})"
-            return m.group(0)
-        s = re.sub(r'\bINSTR\s*\(([^)]+)\)', instr_replace, s, flags=re.IGNORECASE)
+            return f"INSTR({inner})"
+        s = _convert_func_calls(s, 'INSTR', _instr_convert)
 
         # SUBSTR(str, start, len) → SUBSTRING(str, start, len)
         s = re.sub(r'\bSUBSTR\s*\(', 'SUBSTRING(', s, flags=re.IGNORECASE)
@@ -630,6 +638,17 @@ class SyntaxTransformer:
             lambda m: f"PRINT {m.group(1)}",
             s, flags=re.IGNORECASE
         )
+
+        # MOD(a, b) → a % b
+        def mod_replace(m):
+            args = _split_args(m.group(1))
+            if len(args) == 2:
+                return f"({args[0].strip()} % {args[1].strip()})"
+            return m.group(0)
+        s = re.sub(r'\bMOD\s*\(([^)]+)\)', mod_replace, s, flags=re.IGNORECASE)
+
+        # POWER(a, b) → POWER(a, b) — same in T-SQL; no change needed
+        # SIGN(n) — same in T-SQL
 
         # IN 'value' without parentheses → IN ('value')
         # Oracle allows both; T-SQL requires parentheses
