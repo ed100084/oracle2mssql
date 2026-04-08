@@ -192,6 +192,110 @@ class FunctionRule(ConversionRule):
         result = re.sub(r'(?<![!<>:])\s*=\s*NULL\b', ' IS NULL', result, flags=re.IGNORECASE)
         result = re.sub(r'(?:!=|<>)\s*NULL\b', 'IS NOT NULL', result, flags=re.IGNORECASE)
 
+        # Oracle DATE arithmetic: date + N adds N days. T-SQL DATETIME2 does not support + integer.
+        # Convert: CONVERT(DATETIME2(0), expr, style) [+-] N  →  DATEADD(DAY, [+-]N, CONVERT(...))
+        # Also handles CAST(...AS DATETIME2(0)) [+-] N.
+        def _replace_datetime_arith(m):
+            dt_expr = m.group(1).strip()
+            op = m.group(2)
+            n_str = m.group(3)
+            n = float(n_str)
+            if n >= 1 or '.' not in n_str:
+                # Whole days
+                offset = str(int(n)) if op == '+' else f'-{int(n)}'
+                return f'DATEADD(DAY, {offset}, {dt_expr})'
+            else:
+                # Fractional day → convert to seconds (e.g. 0.000695 ≈ 60 s)
+                seconds = round(n * 86400)
+                offset = str(seconds) if op == '+' else f'-{seconds}'
+                return f'DATEADD(SECOND, {offset}, {dt_expr})'
+
+        result = re.sub(
+            r'(CONVERT\s*\(\s*DATETIME2\s*\([^)]*\)\s*,[^,)]+,\s*\d+\s*\)|CAST\s*\([^)]+AS\s+DATETIME2[^)]*\))\s*([+\-])\s*(\d+(?:\.\d+)?)',
+            _replace_datetime_arith,
+            result, flags=re.IGNORECASE
+        )
+
+        # TRY_PARSE(... AS DATETIME2...) [+-] number → DATEADD
+        # Handles patterns like: TRY_PARSE(@x AS DATETIME2(0) USING 'zh-TW') + 1
+        #                    and: TRY_PARSE(@x AS DATETIME2(0) USING 'zh-TW') + 0.000695
+        def _replace_tryparse_arith(m):
+            dt_expr = m.group(1).strip()
+            op = m.group(2)
+            n_str = m.group(3)
+            n = float(n_str)
+            if n >= 1 or '.' not in n_str:
+                offset = str(int(n)) if op == '+' else f'-{int(n)}'
+                return f'DATEADD(DAY, {offset}, {dt_expr})'
+            else:
+                seconds = round(n * 86400)
+                offset = str(seconds) if op == '+' else f'-{seconds}'
+                return f'DATEADD(SECOND, {offset}, {dt_expr})'
+
+        # Use a safe TRY_PARSE pattern with only one level of nesting to avoid
+        # catastrophic backtracking on large files.
+        _tryparse_pat = r'TRY_PARSE\s*\([^()]*(?:\([^()]*\))*[^()]*\)'
+
+        # TRY_PARSE(... AS DATETIME2...) [+-] number → DATEADD
+        result = re.sub(
+            r'(' + _tryparse_pat + r')\s*([+\-])\s*(\d+(?:\.\d+)?)',
+            _replace_tryparse_arith,
+            result, flags=re.IGNORECASE
+        )
+
+        # TRY_PARSE(a) - TRY_PARSE(b) → (DATEDIFF(MINUTE, b, a) / 1440.0)
+        # Oracle date subtraction returns fractional days; *1440 converts to minutes.
+        # DATEDIFF(MINUTE,...)/1440.0 preserves the fractional-day semantic.
+        #
+        # Pattern 1: subtrahend is wrapped in parens: TRY_PARSE(a) - (TRY_PARSE(b))
+        # Must run BEFORE pattern 2 to avoid double-processing.
+        result = re.sub(
+            r'(' + _tryparse_pat + r')\s*-\s*\((' + _tryparse_pat + r')\)',
+            lambda m: f'(DATEDIFF(MINUTE, {m.group(2)}, {m.group(1)}) / 1440.0)',
+            result, flags=re.IGNORECASE
+        )
+        # Pattern 2: subtrahend has no extra parens: TRY_PARSE(a) - TRY_PARSE(b)
+        result = re.sub(
+            r'(' + _tryparse_pat + r')\s*-\s*(' + _tryparse_pat + r')',
+            lambda m: f'(DATEDIFF(MINUTE, {m.group(2)}, {m.group(1)}) / 1440.0)',
+            result, flags=re.IGNORECASE
+        )
+
+        # Handle TRY_PARSE subtraction for cases with 2-level nesting in args
+        # (e.g. FORMAT(MAX(...), 'fmt') inside TRY_PARSE).
+        # Use a character-scanner approach to avoid catastrophic backtracking.
+        result = self._replace_tryparse_subtraction(result)
+
+        _convert_dt_pat = r'CONVERT\s*\(\s*DATETIME2\s*\([^)]*\)\s*,\s*[^,)]+,\s*\d+\s*\)'
+        # Detect DATEADD with 1 level of inner nesting (e.g. DATEADD(DAY, 1, CONVERT(DT2,...)))
+        _dateadd_pat = r'DATEADD\s*\([^()]*(?:\([^()]*\))*[^()]*\)'
+
+        # TRY_PARSE(a) - (DATEADD(X, N, expr)): subtrahend is DATEADD wrapped in parens
+        result = re.sub(
+            r'(' + _tryparse_pat + r')\s*-\s*\((' + _dateadd_pat + r')\)',
+            lambda m: f'(DATEDIFF(MINUTE, {m.group(2)}, {m.group(1)}) / 1440.0)',
+            result, flags=re.IGNORECASE
+        )
+        # (DATEADD(X, N, a)) - (DATEADD(X, N, b)): both operands are DATEADD
+        result = re.sub(
+            r'\((' + _dateadd_pat + r')\)\s*-\s*\((' + _dateadd_pat + r')\)',
+            lambda m: f'(DATEDIFF(MINUTE, {m.group(2)}, {m.group(1)}) / 1440.0)',
+            result, flags=re.IGNORECASE
+        )
+
+        # CONVERT(DATETIME2,...) - CONVERT(DATETIME2,...) → DATEDIFF(DAY, b, a)
+        result = re.sub(
+            r'(' + _convert_dt_pat + r')\s*-\s*(' + _convert_dt_pat + r')',
+            lambda m: f'DATEDIFF(DAY, {m.group(2)}, {m.group(1)})',
+            result, flags=re.IGNORECASE
+        )
+        # CONVERT(DATETIME2,...) - DATEADD(X, N, CONVERT(DATETIME2,...)) → DATEDIFF(DAY, dateadd, convert)
+        result = re.sub(
+            r'(' + _convert_dt_pat + r')\s*-\s*(' + _dateadd_pat + r')',
+            lambda m: f'DATEDIFF(DAY, {m.group(2)}, {m.group(1)})',
+            result, flags=re.IGNORECASE
+        )
+
         return result
 
     def _replace_func(self, source: str, func_name: str, converter, ctx=None):
@@ -310,6 +414,23 @@ class FunctionRule(ConversionRule):
 
     def _convert_trunc(self, args):
         if len(args) >= 2:
+            fmt_arg = args[1].strip()
+            if fmt_arg.startswith("'"):
+                # TRUNC(date, 'format') — date truncation
+                fmt = fmt_arg.strip("'").upper()
+                expr = args[0]
+                if fmt in ('MM', 'MONTH', 'MON'):
+                    return f'DATEADD(MONTH, DATEDIFF(MONTH, 0, {expr}), 0)'
+                elif fmt in ('YY', 'YEAR', 'YYYY', 'RRRR', 'RR'):
+                    return f'DATEADD(YEAR, DATEDIFF(YEAR, 0, {expr}), 0)'
+                elif fmt in ('DD', 'DAY', 'DDD', 'J'):
+                    return f'CAST({expr} AS DATE)'
+                elif fmt in ('HH', 'HH12', 'HH24'):
+                    return f'DATEADD(HOUR, DATEDIFF(HOUR, 0, {expr}), 0)'
+                elif fmt in ('MI',):
+                    return f'DATEADD(MINUTE, DATEDIFF(MINUTE, 0, {expr}), 0)'
+                # Unknown format — truncate to day as safe default
+                return f'CAST({expr} AS DATE)'
             # TRUNC(number, decimals) → ROUND(number, decimals, 1)
             return f"ROUND({args[0]}, {args[1]}, 1)"
         elif len(args) == 1:

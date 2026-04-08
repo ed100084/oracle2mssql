@@ -54,17 +54,25 @@ def deploy_schemas(conn: pyodbc.Connection, schemas: list[str]) -> None:
 
 
 def deploy_object(conn: pyodbc.Connection, sql: str, name: str) -> tuple[bool, str]:
-    """Deploy a single T-SQL object."""
-    try:
-        # Split by GO statements and execute each batch
-        batches = _split_go(sql)
-        for batch in batches:
-            batch = batch.strip()
-            if batch and not batch.startswith("--"):
+    """Deploy a single T-SQL object.
+
+    Executes each GO batch independently so that individual SP/function failures
+    do not prevent the remaining batches from being deployed.
+    Returns (True, "") only if ALL batches succeed; otherwise (False, first_error).
+    """
+    batches = _split_go(sql)
+    errors = []
+    for batch in batches:
+        batch = batch.strip()
+        if batch and not batch.startswith("--"):
+            try:
                 conn.execute(batch)
-        return True, ""
-    except Exception as e:
-        return False, str(e)
+            except Exception as e:
+                errors.append(str(e))
+                logger.warning(f"  [{name}] Batch failed (continuing): {e}")
+    if errors:
+        return False, errors[0]
+    return True, ""
 
 
 def syntax_check(conn: pyodbc.Connection, sql: str) -> tuple[bool, str]:

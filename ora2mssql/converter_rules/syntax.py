@@ -59,6 +59,27 @@ class SyntaxRule(ConversionRule):
         # (e.g., single-line IF...THEN body that was extracted)
         result = self._add_set_keyword(result)
 
+        # After variable substitution, CONVERT(DATETIME2,...) + @var → DATEADD(DAY, @var, CONVERT(...))
+        # FOR loop index variables are now @var (substituted above), enabling this pattern.
+        result = re.sub(
+            r'(CONVERT\s*\(\s*DATETIME2\s*\([^)]*\)\s*,\s*[^,)]+,\s*\d+\s*\))\s*\+\s*(@\w+)',
+            lambda m: f'DATEADD(DAY, {m.group(2)}, {m.group(1)})',
+            result, flags=re.IGNORECASE
+        )
+
+        # @datetime_var + small_fraction BETWEEN → DATEADD(SECOND, N, @var) BETWEEN
+        # Fractional day tolerances in BETWEEN datetime comparisons (e.g., + 0.0001 ≈ +9 seconds).
+        result = re.sub(
+            r'(@\w+)\s*\+\s*(0\.\d+)\s+(?=BETWEEN\b)',
+            lambda m: f'DATEADD(SECOND, {round(float(m.group(2)) * 86400)}, {m.group(1)}) ',
+            result, flags=re.IGNORECASE
+        )
+        result = re.sub(
+            r'(@\w+)\s*-\s*(0\.\d+)\s+(?=BETWEEN\b)',
+            lambda m: f'DATEADD(SECOND, -{round(float(m.group(2)) * 86400)}, {m.group(1)}) ',
+            result, flags=re.IGNORECASE
+        )
+
         # COMMIT WORK → COMMIT
         result = re.sub(r'\bCOMMIT\s+WORK\b', 'COMMIT', result, flags=re.IGNORECASE)
 
@@ -179,6 +200,16 @@ class SyntaxRule(ConversionRule):
         # ---------------------------------------------------------
         # Project-Specific fixes for missing aliases and %ROWTYPE
         # ---------------------------------------------------------
+
+        # f_getoffamt: RETURN(CAST(numeric_expr AS DATE)) → RETURN(numeric_expr)
+        # Oracle allows returning a NUMBER expression from a DATE-typed RETURN; in T-SQL
+        # CAST(arithmetic AS DATE) is a type clash. Strip the CAST and use the raw expression.
+        result = re.sub(
+            r'\bRETURN\s*\(\s*CAST\s*\((@\w+\s*[\*\/\+\-]\s*@\w+(?:\s*[\*\/\+\-]\s*\d+)?)\s+AS\s+DATE\s*\)\s*\)',
+            r'RETURN (\1)',
+            result, flags=re.IGNORECASE
+        )
+
         result = re.sub(r'\)\s*GROUP\s+BY\s+ATT_DATE\s*;', r') AS __derived GROUP BY ATT_DATE;', result, flags=re.IGNORECASE)
         result = re.sub(r'\)\s*--step([1-4])\s*end', r') AS __derived\1 --step\1 end', result, flags=re.IGNORECASE)
         result = re.sub(r'AND\s+ORG_BY\s*=\s*@sOrganType\s*\)\s*;', r'AND ORG_BY = @sOrganType ) AS __derived ;', result, flags=re.IGNORECASE)
@@ -281,13 +312,22 @@ class SyntaxRule(ConversionRule):
         )
 
         # NULL statement → valid T-SQL no-op (comment-only body is invalid in IF blocks)
-        result = re.sub(r'^\s*NULL\s*;\s*$', '    PRINT \'\';  -- NULL (no-op)', result, flags=re.MULTILINE | re.IGNORECASE)
+        # Use DECLARE (not PRINT) so the no-op is valid inside T-SQL scalar functions too.
+        _null_noop_counter = [0]
+        def _make_null_noop(m):
+            _null_noop_counter[0] += 1
+            return f'    DECLARE @__null{_null_noop_counter[0]} INT = 0;  -- NULL (no-op)'
+        result = re.sub(r'^\s*NULL\s*;\s*$', _make_null_noop, result, flags=re.MULTILINE | re.IGNORECASE)
 
         # SSMA converts Oracle NULL; statement to DECLARE @db_null_statement int.
         # This is also not valid as an IF-branch body. Replace with a no-op.
+        _dbnull_counter = [0]
+        def _make_dbnull_noop(m):
+            _dbnull_counter[0] += 1
+            return f'DECLARE @__dbnull{_dbnull_counter[0]} INT = 0;  -- NULL (no-op)'
         result = re.sub(
             r'\bDECLARE\s+@db_null_statement\s+\w+\s*;?',
-            "PRINT '';  -- NULL (no-op)",
+            _make_dbnull_noop,
             result, flags=re.IGNORECASE
         )
 
@@ -304,6 +344,12 @@ class SyntaxRule(ConversionRule):
             r'^\s*\w+\s+utl_\w+\.\w+\s*;',
             lambda m: f"-- {MANUAL_REVIEW_TAG} {m.group(0).strip()}",
             result, flags=re.MULTILINE | re.IGNORECASE
+        )
+        # UTL_INADDR.GET_HOST_ADDRESS bare reference (no parens) — not caught by call patterns
+        result = re.sub(
+            r'\butl_inaddr\.get_host_address\b',
+            f"'127.0.0.1' /* {MANUAL_REVIEW_TAG} utl_inaddr.get_host_address */",
+            result, flags=re.IGNORECASE
         )
         # UTL_SMTP / UTL_* procedure calls (may span multiple lines)
         # Comment each line individually so continuation lines are also commented out
@@ -326,11 +372,19 @@ class SyntaxRule(ConversionRule):
         )
 
         # T-SQL rejects BEGIN...END blocks that contain only whitespace or line comments.
-        # Add PRINT no-op to ensure at least one executable statement in the block.
+        # Add DECLARE no-op (valid in both procedures AND scalar functions; PRINT is not).
         # Must run AFTER UTL_* comment-out so comment-only IF bodies are detected.
+        _blk_noop_counter = [0]
+        def _make_blk_noop(m):
+            _blk_noop_counter[0] += 1
+            return (
+                f"{m.group(1)}{m.group(2)}\n"
+                f"{m.group(3)}{m.group(4)}DECLARE @__noop{_blk_noop_counter[0]} INT = 0;  -- no-op\n"
+                f"{m.group(4)}{m.group(5)}"
+            )
         result = re.sub(
             r'(?m)^([ \t]*)(BEGIN)\s*\n((?:[ \t]*(?:--[^\n]*)?\n)*)([ \t]*)(END\b(?!\s+TRY\b|\s+CATCH\b))',
-            r"\1\2\n\3\4PRINT '';  -- no-op\n\4\5",
+            _make_blk_noop,
             result, flags=re.IGNORECASE
         )
 
@@ -443,6 +497,12 @@ class SyntaxRule(ConversionRule):
         # T-SQL fails to parse procedures where DECLARE statements appear
         # directly before BEGIN TRY without an enclosing BEGIN...END.
         result = self._wrap_top_level_try_catch(result)
+
+        # Batch-level post-processing for scalar functions:
+        #  1. PRINT inside function → DECLARE no-op (error 443)
+        #  2. Add fallback RETURN NULL before function's closing END (error 455)
+        #  3. SELECT with '/* converted: use TOP 1 */' marker → add TOP 1
+        result = self._postprocess_function_batches(result)
 
         return result
 
@@ -701,6 +761,27 @@ class SyntaxRule(ConversionRule):
             # Fix double @@ from DECLARE lines
             result = result.replace(f'DECLARE @@{var}', f'DECLARE @{var}')
             result = result.replace(f'DECLARE [@{var}]', f'DECLARE [{safe}]')
+
+        # FOR loop variables created by _convert_for_loop appear as:
+        #   DECLARE @var INT = N;\nWHILE @var <= ...
+        # These were not in declared_vars (Oracle FOR loops don't declare the counter),
+        # so bare references to 'var' in the loop body were not substituted above.
+        # Detect them now and substitute.
+        for m in re.finditer(
+            r'DECLARE\s+@(\w+)\s+INT\s*=\s*\d+\s*;\s*\n\s*WHILE\s+@\1\b',
+            result, re.IGNORECASE
+        ):
+            loop_var = m.group(1)
+            if loop_var.upper() in declared_vars or loop_var in declared_vars:
+                continue  # already processed
+            safe = safe_var_name(loop_var)
+            result = re.sub(
+                r'(?<![@\[.])\b' + re.escape(loop_var) + r'\b(?!\s+CURSOR)',
+                safe,
+                result, flags=re.IGNORECASE
+            )
+            result = result.replace(f'DECLARE @@{loop_var}', f'DECLARE @{loop_var}')
+            result = result.replace(f'WHILE @@{loop_var}', f'WHILE @{loop_var}')
 
         return result
 
@@ -1564,6 +1645,82 @@ class SyntaxRule(ConversionRule):
             i += 1
 
         return '\n'.join(result)
+
+    def _postprocess_function_batches(self, source: str) -> str:
+        """Batch-level post-processing for scalar T-SQL functions.
+
+        For each GO batch that is a scalar FUNCTION (not a TABLE-valued function):
+        1. Convert PRINT statements → DECLARE no-op (PRINT is invalid in functions, error 443)
+        2. Add 'RETURN NULL; -- fallback' before the function body's closing END (error 455)
+        3. Add TOP 1 to SELECT statements marked with '/* converted: use TOP 1 */'
+        """
+        go_sep = re.compile(r'^GO\s*$', re.MULTILINE)
+        batches = go_sep.split(source)
+        result_batches = []
+        _fn_print_ctr = [0]
+
+        for batch in batches:
+            is_scalar_func = (
+                re.search(r'CREATE\s+OR\s+ALTER\s+FUNCTION\b', batch, re.IGNORECASE) and
+                not re.search(r'\bRETURNS\s+TABLE\b', batch, re.IGNORECASE)
+            )
+            if is_scalar_func:
+                # 1. PRINT → DECLARE no-op (error 443: PRINT not allowed in functions)
+                def _fn_print_noop(m):
+                    _fn_print_ctr[0] += 1
+                    return f'DECLARE @__fnprint{_fn_print_ctr[0]} INT = 0; -- PRINT removed'
+                batch = re.sub(
+                    r'\bPRINT\b[^\n]*;',
+                    _fn_print_noop,
+                    batch, flags=re.IGNORECASE
+                )
+
+                # 2. Add TOP 1 to SELECT statements that have the '/* converted: use TOP 1 */' marker
+                lines = batch.split('\n')
+                for i, line in enumerate(lines):
+                    if '/* converted: use TOP 1 */' in line or "/* converted: use TOP 1 */" in line.lower():
+                        # Find the matching SELECT a few lines back and add TOP 1
+                        for j in range(i - 1, max(0, i - 20), -1):
+                            if re.match(r'\s*SELECT\b(?!\s+TOP\b)', lines[j], re.IGNORECASE):
+                                lines[j] = re.sub(
+                                    r'(\bSELECT\b)(?!\s+TOP\b)',
+                                    r'\1 TOP 1',
+                                    lines[j], count=1, flags=re.IGNORECASE
+                                )
+                                break
+                batch = '\n'.join(lines)
+
+                # 3. Add fallback RETURN NULL before the function body's closing END (error 455)
+                # Walk the batch to find the depth-1 closing END of the function body (after AS).
+                lines = batch.split('\n')
+                depth = 0
+                as_found = False
+                last_depth1_end_idx = -1
+
+                for i, line in enumerate(lines):
+                    s = line.strip()
+                    su = s.upper()
+                    if not as_found:
+                        if re.match(r'^AS\s*$', s, re.IGNORECASE):
+                            as_found = True
+                        continue
+                    # Count BEGIN/END depth (skip BEGIN TRY/CATCH keywords)
+                    if re.match(r'BEGIN\b(?!\s+TRY\b|\s+CATCH\b)', s, re.IGNORECASE):
+                        depth += 1
+                    elif re.match(r'END\b(?!\s+TRY\b|\s+CATCH\b|\s+IF\b|\s+LOOP\b|\s+CASE\b)', s, re.IGNORECASE):
+                        if depth == 1:
+                            last_depth1_end_idx = i
+                        depth = max(0, depth - 1)
+
+                if last_depth1_end_idx >= 0:
+                    # Insert RETURN NULL before the last depth-1 END
+                    indent = lines[last_depth1_end_idx][:len(lines[last_depth1_end_idx]) - len(lines[last_depth1_end_idx].lstrip())]
+                    lines.insert(last_depth1_end_idx, f'{indent}  RETURN NULL; -- [ORA2MSSQL: fallback return]')
+                    batch = '\n'.join(lines)
+
+            result_batches.append(batch)
+
+        return 'GO\n'.join(result_batches)
 
     def _convert_exec_immediate(self, m) -> str:
         """Convert EXECUTE IMMEDIATE with USING clause."""
