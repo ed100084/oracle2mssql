@@ -58,8 +58,12 @@ def deploy_object(conn: pyodbc.Connection, sql: str, name: str) -> tuple[bool, s
 
     Executes each GO batch independently so that individual SP/function failures
     do not prevent the remaining batches from being deployed.
+    If CREATE OR ALTER fails with error 2010 (return type mismatch), automatically
+    DROPs the old object and retries the CREATE.
     Returns (True, "") only if ALL batches succeed; otherwise (False, first_error).
     """
+    import re as _re
+
     batches = _split_go(sql)
     errors = []
     for batch in batches:
@@ -68,7 +72,34 @@ def deploy_object(conn: pyodbc.Connection, sql: str, name: str) -> tuple[bool, s
             try:
                 conn.execute(batch)
             except Exception as e:
-                errors.append(str(e))
+                err_str = str(e)
+                # Error 2010: return type or signature mismatch on CREATE OR ALTER.
+                # Fix: DROP the old object then retry CREATE (without OR ALTER).
+                if '2010' in err_str:
+                    # Extract object type and qualified name from the batch header
+                    m = _re.search(
+                        r'CREATE\s+OR\s+ALTER\s+(FUNCTION|PROCEDURE)\s+(\[\w+\]\.\[\w+\])',
+                        batch, _re.IGNORECASE
+                    )
+                    if m:
+                        obj_type = m.group(1).upper()
+                        obj_name = m.group(2)
+                        try:
+                            conn.execute(f"DROP {obj_type} IF EXISTS {obj_name};")
+                            # Retry with CREATE (not OR ALTER)
+                            retry_batch = _re.sub(
+                                r'\bCREATE\s+OR\s+ALTER\b',
+                                'CREATE',
+                                batch, flags=_re.IGNORECASE, count=1
+                            )
+                            conn.execute(retry_batch)
+                            logger.info(f"  [{name}] Dropped and recreated {obj_name} (error 2010)")
+                            continue  # success — go to next batch
+                        except Exception as e2:
+                            errors.append(str(e2))
+                            logger.warning(f"  [{name}] Retry after DROP failed: {e2}")
+                            continue
+                errors.append(err_str)
                 logger.warning(f"  [{name}] Batch failed (continuing): {e}")
     if errors:
         return False, errors[0]

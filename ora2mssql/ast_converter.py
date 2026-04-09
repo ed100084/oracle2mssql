@@ -631,7 +631,10 @@ class AstConverter:
         )
 
         # Apply transformations to the routine body text
-        body_tsql = self._transform_body_text(routine_source, transformer, param_names)
+        body_tsql = self._transform_body_text(
+            routine_source, transformer, param_names,
+            is_function=routine.is_function,
+        )
 
         # Combine header + body
         tsql = f"{header}\n{body_tsql}\nGO\n"
@@ -663,6 +666,7 @@ class AstConverter:
         source: str,
         transformer: "SyntaxTransformer",
         param_names: set[str],
+        is_function: bool = False,
     ) -> str:
         """Apply all text-level transformations to a routine's source text."""
 
@@ -711,6 +715,11 @@ class AstConverter:
         # 10. Convert EXCEPTION/WHEN → TRY/CATCH FIRST
         # (must be before _fix_if_structure which converts THEN → BEGIN)
         transformed = self._convert_exception_block(transformed)
+        # NOTE: scalar functions (is_function=True) cannot contain TRY/CATCH in T-SQL.
+        # After converting to TRY/CATCH form, strip all TRY/CATCH blocks for functions,
+        # keeping only the try-body content.
+        if is_function:
+            transformed = self._strip_try_catch_for_function(transformed)
 
         # 11. Convert := assignments → SET @var = ...
         transformed = self._convert_assignments(transformed, all_var_names)
@@ -728,6 +737,20 @@ class AstConverter:
         # (done in _final_cleanup with schema info)
 
         # 16. Reassemble with DECLARE + BEGIN...END
+        # For scalar functions, ensure the body always ends with a RETURN statement
+        # (T-SQL error 455: the last statement in a function must be a RETURN).
+        if is_function:
+            body_stripped = transformed.rstrip()
+            if not re.search(r'\bRETURN\b', body_stripped, re.IGNORECASE):
+                # No RETURN at all — add one
+                transformed = body_stripped + '\nRETURN NULL; -- T-SQL: scalar function must return'
+            else:
+                # Check if last non-blank, non-comment line is a bare RETURN
+                last_real = [ln.strip() for ln in body_stripped.splitlines()
+                             if ln.strip() and not ln.strip().startswith('--')]
+                if last_real and not re.match(r'^RETURN\b', last_real[-1], re.IGNORECASE):
+                    transformed = body_stripped + '\nRETURN NULL; -- T-SQL: ensure all paths return'
+
         if declare_block.strip():
             result = f"{declare_block}\nBEGIN\n{transformed}\nEND"
         else:
@@ -1375,6 +1398,144 @@ class AstConverter:
 
         return result
 
+    def _strip_try_catch_for_function(self, body: str) -> str:
+        """
+        For T-SQL scalar functions: remove TRY/CATCH wrappers (error 443).
+        T-SQL scalar UDFs cannot contain BEGIN TRY...END TRY BEGIN CATCH...END CATCH.
+
+        Strategy: replace each BEGIN TRY...END TRY BEGIN CATCH...END CATCH block
+        with just the try-body content (the CATCH handler is dropped).
+        Runs in a loop to handle multiple exception blocks.
+        """
+        result = body
+        for _ in range(100):
+            # Find BEGIN TRY
+            m_try = re.search(r'\bBEGIN\s+TRY\b', result, re.IGNORECASE)
+            if not m_try:
+                break
+
+            try_body_start = m_try.end()
+
+            # Find END TRY (first occurrence after BEGIN TRY)
+            m_end_try = re.search(r'\bEND\s+TRY\b', result[try_body_start:], re.IGNORECASE)
+            if not m_end_try:
+                break
+
+            end_try_abs = try_body_start + m_end_try.start()
+            after_end_try = try_body_start + m_end_try.end()
+
+            try_body = result[try_body_start:end_try_abs]
+
+            # Find optional BEGIN CATCH...END CATCH immediately after END TRY
+            rest = result[after_end_try:]
+            m_catch = re.match(r'\s*BEGIN\s+CATCH\b', rest, re.IGNORECASE)
+            if m_catch:
+                catch_inner_start = after_end_try + m_catch.end()
+                m_end_catch = re.search(r'\bEND\s+CATCH\b', result[catch_inner_start:], re.IGNORECASE)
+                after_catch = (catch_inner_start + m_end_catch.end()) if m_end_catch else after_end_try
+            else:
+                after_catch = after_end_try
+
+            result = (
+                result[:m_try.start()]
+                + "-- EXCEPTION block removed: TRY/CATCH not allowed in T-SQL scalar function\n"
+                + try_body
+                + result[after_catch:]
+            )
+
+        return result
+
+    def _fix_datetime_arithmetic(self, tsql: str) -> str:
+        """
+        Convert Oracle date arithmetic to T-SQL DATEADD calls.
+
+        Oracle allows: date_expr + N  or  date_expr - N  (N = integer days)
+        T-SQL DATETIME2 does NOT support + / - integer; must use DATEADD(DAY, N, expr).
+
+        Patterns handled:
+          CONVERT(DATETIME2, ...)  ± N   →  DATEADD(DAY, ±N, CONVERT(DATETIME2, ...))
+          CAST(... AS DATE)        ± N   →  DATEADD(DAY, ±N, CAST(... AS DATE))
+          GETDATE()                ± N   →  DATEADD(DAY, ±N, GETDATE())
+        """
+        from .ast_visitors.syntax_transformer import _extract_func_args
+
+        def _replace_datetime_arith(m: re.Match) -> str:
+            prefix = m.group(1)   # whitespace / operator before the datetime expr
+            func_name = m.group(2)  # CONVERT / CAST / GETDATE
+            sign = m.group(3)     # + or -
+            n = m.group(4)        # integer literal
+
+            # Rebuild the full datetime expression including its balanced-paren args
+            func_open = m.group(0)
+            # We need the full call; use the match start to find the opening paren
+            return None  # handled below via scanner
+
+        # Use a scanner approach for paren-balanced extraction
+        result_parts: list[str] = []
+        i = 0
+        src = tsql
+
+        # Patterns that produce DATETIME2 / DATE values we want to wrap
+        _DT_FUNCS = re.compile(
+            r'(CONVERT\s*\(\s*DATETIME2|CONVERT\s*\(\s*DATE\b|CAST\s*\([^)]+AS\s+DATE\b|GETDATE\s*\(\s*\))',
+            re.IGNORECASE
+        )
+
+        while i < len(src):
+            m = _DT_FUNCS.search(src, i)
+            if not m:
+                result_parts.append(src[i:])
+                break
+
+            # Emit everything before this match
+            result_parts.append(src[i:m.start()])
+
+            # Find the closing paren for the function call
+            func_start = m.start()
+
+            if 'GETDATE' in src[func_start:func_start+7].upper():
+                # GETDATE() has no inner args
+                func_end = src.index(')', func_start) + 1
+            else:
+                # Find opening paren
+                paren_open = src.index('(', func_start)
+                depth = 0
+                j = paren_open
+                while j < len(src):
+                    if src[j] == '(':
+                        depth += 1
+                    elif src[j] == ')':
+                        depth -= 1
+                        if depth == 0:
+                            func_end = j + 1
+                            break
+                    j += 1
+                else:
+                    # Unbalanced — emit as-is
+                    result_parts.append(src[func_start:])
+                    i = len(src)
+                    break
+
+            dt_expr = src[func_start:func_end]
+
+            # Check what follows the datetime expression: optional whitespace then +/- integer
+            rest = src[func_end:]
+            # Match + N or - N where N is a whole-day integer (NOT a fractional like 0.000695).
+            # Use negative lookahead (?![./]) to avoid matching "0" from "0.000695" or "1/24/60".
+            arith_m = re.match(r'(\s*)([+-])(\s*)(\d+)(?![./\d])', rest)
+            if arith_m:
+                sign = arith_m.group(2)
+                n = arith_m.group(4)
+                days = int(n) if sign == '+' else -int(n)
+                replacement = f'DATEADD(DAY, {days}, {dt_expr})'
+                result_parts.append(replacement)
+                i = func_end + arith_m.end()
+            else:
+                result_parts.append(dt_expr)
+                i = func_end
+
+        return ''.join(result_parts)
+
     def _final_cleanup(self, tsql: str, schema: str, pkg_name: str,
                        routine_names: Optional[set[str]] = None) -> str:
         """Final cleanup passes."""
@@ -1385,12 +1546,55 @@ class AstConverter:
             tsql, flags=re.IGNORECASE
         )
 
+        # Safety pass: strip TRY/CATCH from scalar functions.
+        # _transform_body_text does this, but if ANTLR identified the routine incorrectly
+        # or the fallback path ran, the strip may have been skipped.
+        # Detect functions by header; apply strip if any TRY/CATCH remains.
+        if re.search(r'\bCREATE\s+OR\s+ALTER\s+FUNCTION\b', tsql, re.IGNORECASE):
+            tsql = self._strip_try_catch_for_function(tsql)
+            # Also remove PRINT statements — not allowed in T-SQL scalar functions (error 4).
+            tsql = re.sub(
+                r'(?m)^([ \t]*)PRINT\b[^\n]*\n',
+                r'\1-- PRINT removed: not allowed in T-SQL scalar function\n',
+                tsql, flags=re.IGNORECASE
+            )
+
         # Remove empty parameter list () from no-parameter procedure declarations.
         # T-SQL: "CREATE OR ALTER PROCEDURE [s].[p]" (no parens); Oracle emits empty ().
         tsql = re.sub(
             r'(?m)(CREATE\s+OR\s+ALTER\s+PROCEDURE\s+\[\w+\]\.\[\w+\])\s*\n\s*\(\s*\)',
             r'\1',
             tsql, flags=re.IGNORECASE
+        )
+
+        # Remove empty/comment-only IF blocks (T-SQL requires at least one executable statement).
+        # Pattern: IF (cond) BEGIN [--comment]\n  <only --comments or whitespace, or nothing>\nEND
+        # Replace with just the comment content (moved outside the block).
+        # Use * (not +) for body to also match truly empty blocks (zero lines).
+        # Allow inline comment after BEGIN keyword.
+        # IMPORTANT: skip IF blocks followed by ELSE — those are handled later by the
+        # IF-ELSE inversion ("IF cond BEGIN END ELSE BEGIN content END" → "IF NOT (cond) BEGIN content END").
+        tsql = re.sub(
+            r'(?m)^(\s*)IF\b[^\n]+BEGIN\s*(?:--[^\n]*)?\n((?:\s*(?:--[^\n]*)?\n)*)\s*END\b[^\n]*\n(?!\s*ELSE\b)',
+            r'\2',
+            tsql, flags=re.IGNORECASE
+        )
+
+        # Fix INSERT INTO column lists: remove @ from column names.
+        # _add_var_prefix incorrectly adds @ to column names in INSERT INTO (...) lists
+        # when a same-named parameter exists (e.g. SUBJECT parameter + SUBJECT column).
+        # Pattern: INSERT INTO tbl (\n  col1, @col2, col3\n) VALUES → remove @ from col list.
+        def _fix_insert_columns(m: re.Match) -> str:
+            prefix = m.group(1)   # INSERT INTO table_name
+            cols = m.group(2)     # column list content
+            suffix = m.group(3)   # closing ) VALUES ...
+            # Remove @ prefix from identifiers in the column list
+            fixed_cols = re.sub(r'@(\w+)', r'\1', cols)
+            return prefix + fixed_cols + suffix
+        tsql = re.sub(
+            r'(INSERT\s+INTO\s+\w+\s*\()([^)]+)(\)\s*(?:VALUES|SELECT))',
+            _fix_insert_columns,
+            tsql, flags=re.IGNORECASE | re.DOTALL
         )
 
         # Fix COMMIT WORK → COMMIT TRAN
@@ -1479,19 +1683,77 @@ class AstConverter:
         # T-SQL requires aliases; Oracle does not. Pattern: FROM (subquery) ; or FROM (subquery)\n
         tsql = self._add_derived_table_aliases(tsql)
 
+        # Fix DATE subtraction: T-SQL does not support DATE - DATE arithmetic.
+        # Oracle TRUNC(SYSDATE) - date_col = N → DATEDIFF(DAY, date_col, GETDATE()) = N.
+        # Pattern: CAST(GETDATE() AS DATE) - CAST(expr AS DATE) op N
+        # → DATEDIFF(DAY, CAST(expr AS DATE), CAST(GETDATE() AS DATE)) op N
+        tsql = re.sub(
+            r'CAST\(GETDATE\(\)\s+AS\s+DATE\)\s*-\s*(CAST\([^)]+\)\s+AS\s+DATE\))',
+            r'DATEDIFF(DAY, \1, CAST(GETDATE() AS DATE))',
+            tsql, flags=re.IGNORECASE
+        )
+        # Also: CAST(GETDATE() AS DATE) - CAST(col AS DATE)
+        tsql = re.sub(
+            r'CAST\(GETDATE\(\)\s+AS\s+DATE\)\s*-\s*CAST\(([^)]+)\s+AS\s+DATE\)',
+            r'DATEDIFF(DAY, CAST(\1 AS DATE), CAST(GETDATE() AS DATE))',
+            tsql, flags=re.IGNORECASE
+        )
+
+        # Remove ORDER BY inside derived tables / subqueries (T-SQL error 1033).
+        # In T-SQL, ORDER BY inside a derived table requires TOP or FOR XML.
+        # Oracle allows ORDER BY anywhere in a subquery.
+        # Pattern: ORDER BY clause immediately before closing ) of a FROM (subquery) AS alias.
+        # We remove the ORDER BY to preserve correct syntax; the outer query should handle ordering.
+        tsql = self._remove_subquery_order_by(tsql)
+
         # Convert Oracle NULL statement (standalone NULL; → T-SQL null/empty statement)
         # Use semicolon rather than a comment so that T-SQL's parser sees a real statement.
         # A comment-only BEGIN/END block followed by ELSE causes "near ELSE" parse errors.
         tsql = re.sub(r'(?m)^(\s*)NULL\s*;\s*$', r'\1;  -- null statement', tsql, flags=re.IGNORECASE)
 
-        # Eliminate null-body IF branches: "IF cond BEGIN ; END ELSE BEGIN content END"
-        # → "IF NOT (cond) BEGIN content END"
-        # When the IF branch is only a null statement, negate the condition and use the ELSE content.
-        tsql = re.sub(
-            r'(?m)^(\s*)IF\b([^\n]+?)BEGIN\s*\n\s*;\s*--\s*null statement[^\n]*\n\s*END\s*\n\s*ELSE\s*\n\s*BEGIN\b',
-            lambda m: f'{m.group(1)}IF NOT ({m.group(2).strip()}) BEGIN',
-            tsql, flags=re.IGNORECASE
-        )
+        # Eliminate null-body IF branches followed by ELSE:
+        # "IF cond BEGIN [--comment] END ELSE BEGIN content END"  →  "IF NOT (cond) BEGIN content END"
+        # Covers two sub-cases:
+        #   a) body has only ";" (null statement): after NULL; → ; -- null stmt conversion
+        #   b) body is completely empty (zero lines, maybe inline --comment on BEGIN line)
+        # Run twice so nested occurrences can be resolved.
+        for _ in range(10):
+            prev = tsql
+            # Case a: explicit null statement line
+            tsql = re.sub(
+                r'(?m)^(\s*)IF\b([^\n]+?)BEGIN\s*(?:--[^\n]*)?\n(?:\s*;\s*--[^\n]*\n)?\s*END\b[^\n]*\n\s*ELSE\s*\n\s*BEGIN\b',
+                lambda m: f'{m.group(1)}IF NOT ({m.group(2).strip()}) BEGIN',
+                tsql, flags=re.IGNORECASE
+            )
+            if tsql == prev:
+                break
+
+        # Remove ALL remaining standalone semicolons (bare ; on its own line, possibly with a comment).
+        # Must run AFTER the NULL; → "; -- null statement" conversion and IF/null/ELSE fix above,
+        # so that IF-ELSE inversion can fire first, then leftover null-stmts get purged.
+        # These cause "incorrect syntax near <next token>" (error 156) in T-SQL.
+        tsql = re.sub(r'(?m)^\s*;\s*(?:--[^\n]*)?\n', '', tsql)
+
+        # Third pass empty-IF removal + re-inversion loop:
+        # After the semicolons are removed, inner NULL-body IF blocks may now be truly empty.
+        # Removing them may in turn make an outer IF (that had non-empty body) into an empty IF-ELSE.
+        # Iterate: remove no-ELSE empty IFs → invert any newly exposed empty IF-ELSE → repeat.
+        for _ in range(20):
+            prev = tsql
+            # 3a: remove empty IF blocks that are NOT followed by ELSE
+            tsql = re.sub(
+                r'(?m)^(\s*)IF\b[^\n]+BEGIN\s*(?:--[^\n]*)?\n((?:\s*(?:--[^\n]*)?\n)*)\s*END\b[^\n]*\n(?!\s*ELSE\b)',
+                r'\2',
+                tsql, flags=re.IGNORECASE
+            )
+            # 3b: invert empty IF-ELSE blocks exposed by 3a
+            tsql = re.sub(
+                r'(?m)^(\s*)IF\b([^\n]+?)BEGIN\s*(?:--[^\n]*)?\n(?:\s*;\s*--[^\n]*\n)?\s*END\b[^\n]*\n\s*ELSE\s*\n\s*BEGIN\b',
+                lambda m: f'{m.group(1)}IF NOT ({m.group(2).strip()}) BEGIN',
+                tsql, flags=re.IGNORECASE
+            )
+            if tsql == prev:
+                break
 
         # Strip Oracle outer-join indicator (+) — T-SQL uses explicit LEFT JOIN syntax.
         # Removing (+) converts the join to an implicit inner join (semantics may differ).
@@ -1542,6 +1804,15 @@ class AstConverter:
 
         # Oracle CHR(n) → T-SQL CHAR(n)
         tsql = re.sub(r'\bCHR\s*\(', 'CHAR(', tsql, flags=re.IGNORECASE)
+
+        # Oracle DATE arithmetic: expr + N / expr - N where expr is a DATETIME2/DATE value.
+        # T-SQL does not allow DATETIME2 ± integer; must use DATEADD(DAY, ±N, expr).
+        # Handles:
+        #   CONVERT(DATETIME2, x) + 1   →  DATEADD(DAY, 1, CONVERT(DATETIME2, x))
+        #   CONVERT(DATETIME2, x) - 7   →  DATEADD(DAY, -7, CONVERT(DATETIME2, x))
+        #   CAST(x AS DATE) + 1         →  DATEADD(DAY, 1, CAST(x AS DATE))
+        #   GETDATE() + 1               →  DATEADD(DAY, 1, GETDATE())
+        tsql = self._fix_datetime_arithmetic(tsql)
 
         # Oracle MOD(x, y) → T-SQL (x % y)
         # Uses paren-aware arg splitter to handle nested expressions like MOD(SUM(a*8+b), 8).
@@ -1665,6 +1936,17 @@ class AstConverter:
             tsql, flags=re.IGNORECASE
         )
 
+        # Re-run empty/comment-only IF block removal AFTER UTL_SMTP stubbing.
+        # UTL_SMTP calls inside IF blocks become TODO comments after the stub pass above,
+        # making those IF blocks comment-only. Without this second pass they would remain
+        # and cause "incorrect syntax near 'END'" in T-SQL (empty block not allowed).
+        # Use * (not +) to also catch truly empty blocks; allow inline comment after BEGIN.
+        # Skip IF-ELSE: handled by the IF-ELSE inversion pass below.
+        tsql = re.sub(
+            r'(?m)^(\s*)IF\b[^\n]+BEGIN\s*(?:--[^\n]*)?\n((?:\s*(?:--[^\n]*)?\n)*)\s*END\b[^\n]*\n(?!\s*ELSE\b)',
+            r'\2',
+            tsql, flags=re.IGNORECASE
+        )
 
         # Fix EXEC calls where an arg contains a string concatenation expression
         # (T-SQL EXEC positional args don't allow expressions — must use a variable).
@@ -1681,6 +1963,23 @@ class AstConverter:
             ),
             tsql, flags=re.IGNORECASE
         )
+
+
+        # Fix cursor %ROWTYPE variable field access: var.field → @var
+        # When a cursor is declared with %ROWTYPE and the variable is stored as NVARCHAR(MAX),
+        # any field access like "rec.fieldname" should just be the whole record variable "@rec".
+        # Detect: DECLARE @var NVARCHAR(MAX) /*...%ROWTYPE*/
+        for m_rowtype in re.finditer(
+            r'DECLARE\s+@(\w+)\s+\w+[^\n]*/\*[^*]*%ROWTYPE[^*]*\*/',
+            tsql, re.IGNORECASE
+        ):
+            var_name = m_rowtype.group(1)
+            # Replace bare "var_name.field" (no @ prefix) with "@var_name"
+            tsql = re.sub(
+                r'(?<!\w)' + re.escape(var_name) + r'\.\w+(?!\w)',
+                '@' + var_name,
+                tsql, flags=re.IGNORECASE
+            )
 
         # Convert Oracle block labels <<label>> → label: (T-SQL GOTO label)
         tsql = re.sub(r'<<(\w+)>>', r'\1:', tsql)
@@ -1999,6 +2298,64 @@ class AstConverter:
             tsql
         )
         return tsql
+
+    def _remove_subquery_order_by(self, tsql: str) -> str:
+        """
+        Remove ORDER BY clauses inside derived table subqueries (T-SQL error 1033).
+
+        T-SQL requires TOP or FOR XML when ORDER BY appears inside a subquery/derived table.
+        Oracle allows ORDER BY anywhere. We remove such ORDER BY clauses; outer queries should
+        handle ordering.
+
+        Handles two forms:
+          1. Same-line:  ORDER BY col1, col2) AS alias
+          2. Multi-line: ORDER BY col1, col2
+                         ) AS alias
+        """
+        _comment = '-- ORDER BY removed: not allowed in T-SQL subquery without TOP/FOR XML'
+
+        # --- Pass 1: same-line form ---
+        # Pattern: ORDER BY <cols>) AS <alias>  all on one line
+        # Keep the ") AS alias" part; replace "ORDER BY <cols>" with a comment.
+        def _replace_inline(m: re.Match) -> str:
+            indent = m.group(1)
+            closing = m.group(2).strip()   # ) or ) AS alias
+            return f'{indent}{_comment}\n{indent}{closing}'
+
+        tsql = re.sub(
+            r'^(\s*)ORDER\s+BY\s+.+?(\)\s*(?:AS\s+\w+)?)\s*$',
+            _replace_inline,
+            tsql,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+
+        # --- Pass 2: multi-line form ---
+        # A line containing only "ORDER BY ..." followed (after possible continuation lines)
+        # by a line that starts with ) or ) AS alias.
+        lines = tsql.split('\n')
+        result: list[str] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if re.match(r'^\s*ORDER\s+BY\b', line, re.IGNORECASE):
+                # Collect continuation lines (col names, ASC/DESC qualifiers)
+                j = i + 1
+                while j < len(lines) and re.match(
+                    r'^\s*(?:[\w\.\[\]]+\s*(?:ASC|DESC)?\s*,?\s*)$', lines[j], re.IGNORECASE
+                ):
+                    j += 1
+                # If the next line is a closing paren of a derived table, remove ORDER BY block
+                if j < len(lines) and re.match(
+                    r'^\s*\)\s*(?:AS\s+\w+|INNER|LEFT|RIGHT|FULL|CROSS|JOIN|ON|WHERE|GROUP|HAVING|UNION|$)',
+                    lines[j], re.IGNORECASE
+                ):
+                    indent = line[:len(line) - len(line.lstrip())]
+                    result.append(f'{indent}{_comment}')
+                    i = j  # skip ORDER BY lines; keep the closing paren line
+                    continue
+            result.append(line)
+            i += 1
+        return '\n'.join(result)
 
     def _add_derived_table_aliases(self, tsql: str) -> str:
         """Add missing aliases to unaliased derived tables.
