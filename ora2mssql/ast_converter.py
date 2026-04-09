@@ -1544,40 +1544,115 @@ class AstConverter:
         tsql = re.sub(r'\bCHR\s*\(', 'CHAR(', tsql, flags=re.IGNORECASE)
 
         # Oracle MOD(x, y) → T-SQL (x % y)
-        # Simple two-arg form; handles non-nested args.
-        def _convert_mod(m):
-            return f'({m.group(1).strip()} % {m.group(2).strip()})'
-        tsql = re.sub(
-            r'\bMOD\s*\(([^,()]+),\s*([^()]+)\)',
-            _convert_mod,
-            tsql, flags=re.IGNORECASE
-        )
+        # Uses paren-aware arg splitter to handle nested expressions like MOD(SUM(a*8+b), 8).
+        from .ast_visitors.syntax_transformer import _convert_func_calls, _split_args, _extract_func_args
+        def _mod_converter(inner: str) -> str:
+            args = _split_args(inner)
+            if len(args) == 2:
+                return f'({args[0].strip()} % {args[1].strip()})'
+            return f'MOD({inner})'
+        tsql = _convert_func_calls(tsql, 'MOD', _mod_converter)
 
         # Oracle ROUND(x) single-arg → T-SQL ROUND(x, 0) (T-SQL requires scale arg).
-        # Avoid matching ROUND(x, y) which already has two args.
-        tsql = re.sub(
-            r'\bROUND\s*\(([^,()]+)\)',
-            r'ROUND(\1, 0)',
-            tsql, flags=re.IGNORECASE
-        )
+        # Uses paren-aware extractor to handle nested expressions like ROUND(CAST(...)*1440).
+        def _round_converter(inner: str) -> str:
+            args = _split_args(inner)
+            if len(args) == 1:
+                return f'ROUND({inner}, 0)'
+            return f'ROUND({inner})'
+        tsql = _convert_func_calls(tsql, 'ROUND', _round_converter)
 
         # Oracle TO_NUMBER(val, 'mask') was converted to CAST(val, mask AS type).
         # Remove the format mask — T-SQL CAST doesn't support it.
-        # Pattern: CAST(expr, digits AS type) → CAST(expr AS type)
+        # Pattern: CAST(expr_with_possible_commas, numericMask AS type) → CAST(expr AS type)
+        # Uses paren-aware splitter to handle exprs like CAST(SUBSTRING(x, 1, 4), 9999 AS DECIMAL).
+        def _cast_strip_mask(inner: str) -> str:
+            args = _split_args(inner)
+            if len(args) == 2:
+                # Check if 2nd arg looks like "numericMask AS type" or "'mask' AS type"
+                m = re.match(r"^\s*'?[\dX9,]+(?:V\d+)?'?\s+AS\s+(.+)$", args[1].strip(), re.IGNORECASE)
+                if m:
+                    return f'CAST({args[0].strip()} AS {m.group(1).strip()})'
+            return f'CAST({inner})'
+        tsql = _convert_func_calls(tsql, 'CAST', _cast_strip_mask)
+
+        # Fix EXEC [schema].[func] used inside arithmetic expression (scalar function call).
+        # Oracle: SET var = func1(...) + func2(...);
+        # Converter incorrectly emits: SET var = func1(...) +\n    EXEC [schema].[func2] arg1, arg2, ...;
+        # Fix: remove EXEC keyword, wrap args in parentheses.
+        def _exec_to_func_in_expr(m: re.Match) -> str:
+            func = m.group(1)
+            args_raw = m.group(2)
+            # Normalize whitespace in arg list
+            args = ', '.join(a.strip() for a in args_raw.split(',') if a.strip())
+            return f'+ {func}({args})'
         tsql = re.sub(
-            r'\bCAST\s*\(([^,\n]+),\s*\d+\s+AS\s+(\w+(?:\(\d+(?:,\s*\d+)?\))?)\)',
-            r'CAST(\1 AS \2)',
-            tsql, flags=re.IGNORECASE
+            r'\+\s*EXEC\s+(\[\w+\]\.\[\w+\])\s+([^;]+?);',
+            _exec_to_func_in_expr,
+            tsql, flags=re.IGNORECASE | re.DOTALL
         )
 
-        # Comment out Oracle UTL_SMTP procedure calls (no T-SQL equivalent).
+        # Comment out Oracle UTL_SMTP / UTL_RAW / UTL_TCP / UTL_ENCODE procedure calls.
         # Replace entire statement line(s) with a TODO comment.
+        # First handle UTL_TCP.CRLF constant (replace with T-SQL equivalent).
+        tsql = re.sub(r'\bUTL_TCP\.CRLF\b', "CHAR(13)+CHAR(10)", tsql, flags=re.IGNORECASE)
+        # Comment out multi-line Oracle package calls (UTL_SMTP, UTL_RAW, UTL_ENCODE).
+        # Uses a paren-balanced extractor to span multiple lines.
+        _oracle_pkg_patterns = re.compile(
+            r'(?m)^([ \t]*)((?:UTL_SMTP|UTL_RAW|UTL_ENCODE)\.\w+)\s*\(',
+            re.IGNORECASE
+        )
+        def _stub_oracle_pkg_stmt(tsql_in: str) -> str:
+            """Comment out full statement for Oracle package calls spanning multiple lines."""
+            result = []
+            pos = 0
+            for m in _oracle_pkg_patterns.finditer(tsql_in):
+                if m.start() < pos:
+                    continue  # already processed as part of a larger outer statement
+                result.append(tsql_in[pos:m.start()])
+                indent = m.group(1)
+                call_name = m.group(2)
+                # Find balanced closing paren starting after '('
+                paren_start = m.end()  # char after '('
+                depth = 1
+                j = paren_start
+                in_str = False
+                str_char = ''
+                while j < len(tsql_in) and depth > 0:
+                    ch = tsql_in[j]
+                    if in_str:
+                        if ch == str_char:
+                            in_str = False
+                    elif ch in ("'", '"'):
+                        in_str, str_char = True, ch
+                    elif ch == '(':
+                        depth += 1
+                    elif ch == ')':
+                        depth -= 1
+                    j += 1
+                # j is after closing ')', find next ';'
+                semi = tsql_in.find(';', j)
+                end = semi + 1 if semi != -1 else j
+                full_stmt = tsql_in[m.start():end]
+                # Comment out every non-comment line
+                commented_lines = []
+                for ln in full_stmt.split('\n'):
+                    if ln.strip() and not ln.strip().startswith('--'):
+                        commented_lines.append(f'{indent}-- TODO(oracle_pkg): {ln.lstrip()}')
+                    else:
+                        commented_lines.append(ln)
+                result.append('\n'.join(commented_lines))
+                pos = end
+            result.append(tsql_in[pos:])
+            return ''.join(result)
+        tsql = _stub_oracle_pkg_stmt(tsql)
+        # Also handle single-line utl_smtp.* calls (legacy pattern for safety)
         tsql = re.sub(
             r'(?m)^([ \t]*)(\w+\.(?:open_connection|helo|mail|rcpt|open_data|write_raw_data|close_data|quit)\s*\([^;]*\))\s*;',
             r'\1-- TODO(utl_smtp): \2;',
             tsql, flags=re.IGNORECASE
         )
-        # Also handle SET var = utl_smtp.*
+        # Handle SET var = utl_smtp.*
         tsql = re.sub(
             r'(?m)^([ \t]*)(SET\s+@\w+\s*=\s*\w+\.(?:open_connection|connection)\s*\([^;]*\))\s*;',
             r'\1-- TODO(utl_smtp): \2;',
@@ -1589,6 +1664,7 @@ class AstConverter:
             'NVARCHAR(MAX)',
             tsql, flags=re.IGNORECASE
         )
+
 
         # Fix EXEC calls where an arg contains a string concatenation expression
         # (T-SQL EXEC positional args don't allow expressions — must use a variable).
